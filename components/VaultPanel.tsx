@@ -77,7 +77,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
     if (busy || submitted || operation || !operationLoaded) return
     try {
       const recipient = parseShieldedAddress(payoutAddress, 'testnet')
-      if (recipient.pools.length !== 1 || recipient.preferredPool !== 'orchard' || !recipient.address.startsWith('utest1')) throw new Error('Use an Orchard-only testnet Unified Address.')
+      if (recipient.preferredPool !== 'orchard' || !recipient.address.startsWith('utest1')) throw new Error('Use a testnet Unified Address with an Orchard receiver.')
       if (!authorized) throw new Error('Authorize the server wallet payout before claiming.')
       setSubmitted(true)
       await action(refund ? 'refund' : 'claim', refund ? { refundAddress: recipient.address } : { payoutAddress: recipient.address })
@@ -98,7 +98,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
         <h2 id="vault-heading" style={{ fontSize: 20, fontWeight: 700 }}>Custodial testnet vault</h2>
       </div>
       <p style={{ color: 'var(--muted-2)', fontSize: 14, lineHeight: 1.7, marginBottom: 16 }}>
-        The ZCashed operator controls this Zallet vault. Deposits and payouts use native testnet ZEC and an Orchard receiver.
+        The ZCashed operator controls this native Zcash vault. Deposits and payouts use testnet ZEC and an Orchard receiver.
         GenLayer reviews work; the server wallet signs an authorized worker payout after approval, or a client refund after rejection or cancellation.
       </p>
       <p style={{ fontWeight: 700, fontSize: 18, marginBottom: 16 }}>
@@ -111,6 +111,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
           <p style={{ color: 'var(--muted-2)', fontSize: 13, lineHeight: 1.7, marginBottom: 16 }}>
             Send exactly {formatZatoshis(job.budgetZatoshis)} testnet ZEC with the included encrypted memo. Confirm the testnet network,
             full destination, amount and memo in your wallet. Your wallet signs the deposit after you approve it.
+            Send each job deposit in its own transaction, without other recipients.
           </p>
           {qr?.uri === payment.uri && <Image src={qr.image} width={256} height={256} unoptimized alt="Testnet Zcash job deposit request QR" style={{ maxWidth: '100%', height: 'auto', margin: '0 auto 16px' }} />}
           <div className="flex flex-wrap gap-3" style={{ marginBottom: 16 }}>
@@ -122,7 +123,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
           <button type="button" className="btn btn-outline" disabled={busy} onClick={() => action('funding', {})} style={{ minHeight: 44, marginTop: 16 }}>
             <ShieldCheck size={16} /> {busy ? 'Checking the wallet…' : 'Check confirmed deposit'}
           </button>
-          <p style={{ color: 'var(--muted-2)', fontSize: 12, lineHeight: 1.7, marginTop: 12 }}>The job opens after the server wallet confirms this exact receiver, amount and memo with at least one confirmation. The request itself does not lock or confirm funds.</p>
+          <p style={{ color: 'var(--muted-2)', fontSize: 12, lineHeight: 1.7, marginTop: 12 }}>The job opens after the vault receives the exact amount and unique memo in a confirmed shielded transaction. Each transaction funds one job. The payment request itself does not confirm funds.</p>
         </div>
       )}
       {client && job.status === 'funding_required' && !payment && <p role="alert">The stored vault request is invalid. Contact the operator before sending funds.</p>}
@@ -134,7 +135,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
       )}
       {worker && job.status === 'approved' && funded && !operation && !submitted && (
         <form onSubmit={(event) => authorizeRelease(event)} style={{ display: 'grid', gap: 16 }}>
-          <label htmlFor="vault-payout" style={{ fontWeight: 600, fontSize: 14 }}>Your private Orchard-only testnet payout address</label>
+          <label htmlFor="vault-payout" style={{ fontWeight: 600, fontSize: 14 }}>Your private testnet payout address</label>
           <textarea id="vault-payout" value={payoutAddress} onChange={(event) => setPayoutAddress(event.target.value)} required autoComplete="off" spellCheck={false} maxLength={1023} placeholder="utest1…" rows={3} style={{ width: '100%', padding: 12, fontSize: 12, overflowWrap: 'anywhere' }} />
           <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', fontSize: 13, lineHeight: 1.7 }}>
             <input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} style={{ marginTop: 5 }} />
@@ -146,7 +147,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
       )}
       {client && ['cancelled', 'rejected'].includes(job.status) && funded && !operation && !submitted && (
         <form onSubmit={(event) => authorizeRelease(event, true)} style={{ display: 'grid', gap: 16 }}>
-          <label htmlFor="vault-refund" style={{ fontWeight: 600, fontSize: 14 }}>Your private Orchard-only testnet refund address</label>
+          <label htmlFor="vault-refund" style={{ fontWeight: 600, fontSize: 14 }}>Your private testnet refund address</label>
           <textarea id="vault-refund" value={payoutAddress} onChange={(event) => setPayoutAddress(event.target.value)} required autoComplete="off" spellCheck={false} maxLength={1023} placeholder="utest1…" rows={3} style={{ width: '100%', padding: 12, fontSize: 12, overflowWrap: 'anywhere' }} />
           <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start', fontSize: 13, lineHeight: 1.7 }}>
             <input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} style={{ marginTop: 5 }} />

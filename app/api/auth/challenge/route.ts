@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { apiErrorResponse, createWalletChallenge } from '@/lib/auth'
 
 export async function POST(req: NextRequest) {
-  try { return NextResponse.json(createWalletChallenge(req, (await req.json()).walletAddress)) }
+  try {
+    const body = await req.json()
+    return NextResponse.json(createWalletChallenge(req, body.walletAddress, body.unifiedAddress))
+  }
   catch (error) { return apiErrorResponse(error) }
 }

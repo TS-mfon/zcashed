@@ -1,4 +1,5 @@
 import { formatZatoshis, MAX_ZATOSHIS, parseShieldedAddress } from './zcash'
+import { zingoConfiguration, deriveZingoVaultAddress, verifyZingoDeposit, prepareZingoPayout, sendZingoPayout, inspectZingoPayout } from './zingo'
 
 // Verified against Zallet v0.1.0-beta.4, not the legacy zcashd RPC schemas.
 // https://github.com/zcash/zallet/tree/v0.1.0-beta.4/zallet-core/src/components/json_rpc
@@ -18,6 +19,7 @@ export class ZalletSendUncertainError extends ZalletError {
 }
 
 export function zalletConfiguration() {
+  if (process.env.ZINGO_RPC_URL) return zingoConfiguration()
   const rpcUrl = process.env.ZALLET_RPC_URL?.trim()
   const user = process.env.ZALLET_RPC_USER
   const password = process.env.ZALLET_RPC_PASSWORD
@@ -101,6 +103,7 @@ async function syncedWallet(): Promise<number> {
 }
 
 export async function deriveVaultAddress(diversifierIndex: number): Promise<{ address: string; accountId: string; startHeight: number }> {
+  if (process.env.ZINGO_RPC_URL) return deriveZingoVaultAddress(diversifierIndex)
   if (!integer(diversifierIndex, 1)) throw new ZalletError('Invalid vault diversifier index.')
   const configuration = zalletConfiguration()
   const startHeight = await syncedWallet()
@@ -112,7 +115,7 @@ export async function deriveVaultAddress(diversifierIndex: number): Promise<{ ad
   return { address: await orchardReceiver(result.address), accountId: configuration.accountId, startHeight }
 }
 
-export interface VaultReceipt { txid: string; outputIndex: number; amountZatoshis: number; confirmations: number }
+export interface VaultReceipt { txid: string; outputIndex?: number; receiptId?: string; receiptType?: 'whole-shielded-account-transaction'; amountZatoshis: number; confirmations: number }
 function memoMatches(output: Row, memo: string): boolean {
   if (output.memoStr !== memo || typeof output.memo !== 'string' || !/^[0-9a-f]{1024}$/i.test(output.memo)) return false
   const bytes = Buffer.from(memo, 'utf8')
@@ -126,6 +129,7 @@ function shieldedOutput(output: Row, address: string, value: number, memo: strin
 }
 
 export async function verifyVaultDeposit(input: { address: string; reference: string; amountZatoshis: number; startHeight: number }): Promise<VaultReceipt | null> {
+  if (process.env.ZINGO_RPC_URL) return verifyZingoDeposit(input)
   amount(input.amountZatoshis)
   const configuration = zalletConfiguration()
   const height = await syncedWallet()
@@ -155,6 +159,7 @@ export async function verifyVaultDeposit(input: { address: string; reference: st
 }
 
 export async function prepareShieldedPayout(address: string, amountZatoshis: number): Promise<string> {
+  if (process.env.ZINGO_RPC_URL) return prepareZingoPayout(address, amountZatoshis)
   amount(amountZatoshis)
   await syncedWallet()
   const recipient = await orchardReceiver(address)
@@ -175,6 +180,7 @@ export async function prepareShieldedPayout(address: string, amountZatoshis: num
 }
 
 export async function sendShieldedPayout(input: { address: string; amountZatoshis: number; memo: string }): Promise<{ txid: string; broadcast: boolean }> {
+  if (process.env.ZINGO_RPC_URL) return sendZingoPayout(input)
   const address = await prepareShieldedPayout(input.address, input.amountZatoshis)
   const memo = Buffer.from(input.memo, 'utf8')
   if (!memo.length || memo.length > 512 || memo[0] > 0xf4) throw new ZalletError('Invalid opaque payout memo.')
@@ -188,6 +194,7 @@ export async function sendShieldedPayout(input: { address: string; amountZatoshi
 }
 
 export async function inspectPayout(input: { txid: string; address: string; amountZatoshis: number; memo: string }): Promise<{ confirmed: boolean; confirmations: number }> {
+  if (process.env.ZINGO_RPC_URL) return inspectZingoPayout(input)
   amount(input.amountZatoshis)
   await syncedWallet()
   const address = await orchardReceiver(input.address)

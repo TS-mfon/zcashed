@@ -70,11 +70,12 @@ function unifiedPools(bytes: Uint8Array, prefix: string): ShieldedPool[] {
       throw new Error('Invalid Unified Address receiver order or length.')
     }
     if (type.value === 0 || type.value === 1) {
-      throw new Error('Use a shielded-only address without a transparent fallback.')
+      if (length.value !== 20 || previous === 0) throw new Error('Invalid transparent receiver in Unified Address.')
+    } else {
+      if (type.value !== 2 && type.value !== 3) throw new Error('This demo supports Sapling and Orchard shielded receivers only.')
+      if (length.value !== 43) throw new Error('Invalid shielded receiver length.')
+      pools = [...pools, type.value === 3 ? 'orchard' : 'sapling']
     }
-    if (type.value !== 2 && type.value !== 3) throw new Error('This demo supports Sapling and Orchard receivers only.')
-    if (length.value !== 43) throw new Error('Invalid shielded receiver length.')
-    pools = [...pools, type.value === 3 ? 'orchard' : 'sapling']
     previous = type.value
     offset = length.next + length.value
   }
@@ -91,7 +92,7 @@ export function parseShieldedAddress(address: string, network: ZcashNetwork): Sh
   const prefix = normalized.toLowerCase().slice(0, normalized.toLowerCase().lastIndexOf('1'))
   const addressNetwork = prefix === 'u' || prefix === 'zs' ? 'mainnet'
     : prefix === 'utest' || prefix === 'ztestsapling' ? 'testnet' : null
-  if (!addressNetwork) throw new Error('Use a Sapling address or a shielded-only Unified Address (revision 0).')
+  if (!addressNetwork) throw new Error('Use a Sapling address or a Unified Address with a shielded receiver.')
   if (network !== addressNetwork) throw new Error(`This address is for ${addressNetwork}; select that network.`)
   let bytes: Uint8Array
   try {

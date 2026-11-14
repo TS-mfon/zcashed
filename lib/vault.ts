@@ -22,6 +22,11 @@ export interface PrivateVaultOperation { purpose: ReleasePurpose; state: ClaimSt
 export class VaultError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
 }
+function receiptIdentity(receipt: VaultReceipt): string {
+  if (receipt.receiptType === 'whole-shielded-account-transaction' && receipt.receiptId === receipt.txid) return receipt.txid
+  if (Number.isSafeInteger(receipt.outputIndex) && receipt.outputIndex! >= 0) return receipt.txid + ':' + receipt.outputIndex
+  throw new VaultError(503, 'The wallet receipt cannot be reserved safely.')
+}
 async function database(): Promise<Db> {
   const db = await getMongoDatabase()
   if (!db) throw new VaultError(503, 'MongoDB is required for durable custodial vault reservations.')
@@ -106,7 +111,7 @@ export async function confirmJobFunding(job: Job): Promise<{ job: Job; received:
     amountZatoshis: job.budgetZatoshis, startHeight: allocation.startHeight! })
   if (!receipt) return { job, received: false }
   const deposit: Deposit = { _id: 'deposit:' + job.id, kind: 'deposit', jobId: job.id, accountId: allocation.accountId,
-    address: job.vaultAddress, reference: job.vaultReference, receiptId: receipt.txid + ':' + receipt.outputIndex,
+    address: job.vaultAddress, reference: job.vaultReference, receiptId: receiptIdentity(receipt),
     receipt, confirmedAt: new Date().toISOString() }
   try {
     const result = await deposits(db).insertOne(deposit)
@@ -187,7 +192,7 @@ async function releaseFunding(db: Db, job: Job): Promise<Allocation> {
   }
   const currentReceipt = await verifyVaultDeposit({ address: job.vaultAddress, reference: job.vaultReference,
     amountZatoshis: job.budgetZatoshis, startHeight: allocation.startHeight! })
-  if (!currentReceipt || currentReceipt.txid !== deposit.receipt.txid || currentReceipt.outputIndex !== deposit.receipt.outputIndex) {
+  if (!currentReceipt || receiptIdentity(currentReceipt) !== deposit.receiptId) {
     throw new VaultError(409, 'The wallet no longer confirms the reserved funding receipt.')
   }
   return allocation
@@ -201,14 +206,14 @@ async function releaseJobFunds(job: Job, payoutAddress: string | undefined, purp
     return reconcile(db, (await getJob(job.id)) ?? job, existing)
   }
   releaseEligibility(job, purpose)
-  if (typeof payoutAddress !== 'string') throw new VaultError(400, 'Enter your Orchard-only testnet payout address.')
+  if (typeof payoutAddress !== 'string') throw new VaultError(400, 'Enter your testnet Unified Address.')
   let recipient: string
   try {
     const parsed = parseShieldedAddress(payoutAddress, 'testnet')
-    if (parsed.pools.length !== 1 || parsed.preferredPool !== 'orchard') throw new Error('Orchard-only address required')
+    if (parsed.preferredPool !== 'orchard') throw new Error('Orchard receiver required')
     recipient = parsed.address
   }
-  catch { throw new VaultError(400, 'Use a valid Orchard-only testnet Unified Address copied from your existing wallet.') }
+  catch { throw new VaultError(400, 'Use a valid testnet Unified Address with an Orchard receiver copied from your existing wallet.') }
   const allocation = await releaseFunding(db, job)
   recipient = await prepareShieldedPayout(recipient, job.budgetZatoshis)
   const now = new Date().toISOString()
