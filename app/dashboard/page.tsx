@@ -1,13 +1,16 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useWallet } from '@/components/WalletContext'
 import { JobCard } from '@/components/JobCard'
 import { Job, Application } from '@/lib/types'
 import { formatZec, shortenAddress, timeAgo } from '@/lib/utils'
-import { Plus, Briefcase, ExternalLink, Info, Loader2, Send } from 'lucide-react'
+import { Plus, Briefcase, ExternalLink, Loader2, Send } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
 import Link from 'next/link'
+
+type DashboardTab = 'posted' | 'working' | 'applications'
 
 export default function DashboardPage() {
   const { address, isConnected, isLoading, role, profile } = useWallet()
@@ -16,50 +19,60 @@ export default function DashboardPage() {
   const [posted, setPosted] = useState<Job[]>([])
   const [working, setWorking] = useState<Job[]>([])
   const [applications, setApplications] = useState<Application[]>([])
-  const [loading, setLoading] = useState(false)
-  const [tab, setTab] = useState<'posted' | 'working' | 'applications'>(role === 'client' ? 'posted' : 'working')
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [tabSelection, setTabSelection] = useState<{ role: string | null; tab: DashboardTab } | null>(null)
+  const tab = tabSelection?.role === role ? tabSelection.tab : role === 'client' ? 'posted' : 'working'
 
   useEffect(() => {
     if (!isLoading && !isConnected) router.push('/onboarding')
   }, [isLoading, isConnected, router])
 
-  useEffect(() => {
-    if (role === 'client') setTab('posted')
-    else setTab('working')
-  }, [role])
-
-  useEffect(() => {
-    if (address) loadAll()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [address])
-
-  async function loadAll() {
+  const loadAll = useCallback(async () => {
     setLoading(true)
+    setError('')
     try {
-      const [jobsRes, appsRes] = await Promise.all([
-        fetch(`/api/jobs?address=${encodeURIComponent(address!)}`).then((r) => r.json()),
-        fetch(`/api/applications?address=${encodeURIComponent(address!)}`).then((r) => r.json()),
-      ])
-      setPosted(jobsRes.posted ?? [])
-      setWorking(jobsRes.working ?? [])
-      setApplications(appsRes.applications ?? [])
+      const { jobs, apps } = await fetchDashboardData()
+      setPosted(jobs.posted ?? [])
+      setWorking(jobs.working ?? [])
+      setApplications(apps.applications ?? [])
     } catch {
-      /* ignore */
+      setError('Unable to load your jobs and applications. Please try again.')
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    if (!address) return
+    const controller = new AbortController()
+    fetchDashboardData(controller.signal)
+      .then(({ jobs, apps }) => {
+        if (controller.signal.aborted) return
+        setPosted(jobs.posted ?? [])
+        setWorking(jobs.working ?? [])
+        setApplications(apps.applications ?? [])
+        setError('')
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setError('Unable to load your jobs and applications. Please try again.')
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    return () => controller.abort()
+  }, [address])
 
   if (isLoading || !isConnected) {
     return <div className="py-20 text-center"><Loader2 size={30} className="spin" style={{ color: 'var(--primary)', margin: '0 auto' }} /></div>
   }
 
-  const earned = working.filter((j) => j.status === 'completed').reduce((s, j) => s + j.budgetZec, 0)
-  const pending = working.filter((j) => ['in_progress', 'under_review', 'approved'].includes(j.status)).reduce((s, j) => s + j.budgetZec, 0)
-  const escrow = posted.filter((j) => j.status !== 'completed' && j.status !== 'cancelled').reduce((s, j) => s + j.budgetZec, 0)
+  const confirmed = working.filter((j) => j.status === 'completed' && j.fundedAt).reduce((sum, job) => sum + job.budgetZatoshis, 0) / 100000000
+  const pending = working.filter((j) => ['in_progress', 'under_review', 'needs_revision', 'approved', 'claiming'].includes(j.status)).reduce((sum, job) => sum + job.budgetZatoshis, 0) / 100000000
+  const offered = posted.filter((j) => j.status !== 'cancelled').reduce((sum, job) => sum + job.budgetZatoshis, 0) / 100000000
 
-  const tabs = [
-    ...(role === 'client' || posted.length > 0 ? [{ k: 'posted', l: `Posted (${posted.length})` }] : []),
+  const tabs: { k: DashboardTab; l: string }[] = [
+    ...(role === 'client' || posted.length > 0 ? [{ k: 'posted' as const, l: `Posted (${posted.length})` }] : []),
     { k: 'working', l: `My Work (${working.length})` },
     { k: 'applications', l: `My Applications (${applications.length})` },
   ]
@@ -81,9 +94,9 @@ export default function DashboardPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4" style={{ marginBottom: 24 }}>
         {[
           { label: 'Jobs Posted', value: posted.length, color: 'var(--text)' },
-          { label: 'Earned (ZEC)', value: earned.toFixed(3), color: 'var(--primary-dark)' },
-          { label: 'Pending (ZEC)', value: pending.toFixed(3), color: 'var(--gold)' },
-          { label: 'In Escrow (ZEC)', value: escrow.toFixed(3), color: 'var(--muted-2)' },
+          { label: 'Confirmed payouts (ZEC)', value: confirmed.toFixed(8), color: 'var(--primary-dark)' },
+          { label: 'Active work offers (ZEC)', value: pending.toFixed(3), color: 'var(--gold)' },
+          { label: 'Posted offers (ZEC)', value: offered.toFixed(3), color: 'var(--muted-2)' },
         ].map((c) => (
           <div key={c.label} className="card" style={{ padding: '18px 22px' }}>
             <div style={{ fontSize: 24, fontWeight: 800, color: c.color, fontFamily: 'var(--font-geist-mono)' }}>{c.value}</div>
@@ -91,12 +104,19 @@ export default function DashboardPage() {
           </div>
         ))}
       </div>
+      <p style={{ color: 'var(--muted-2)', fontSize: 13, marginBottom: 20 }}>
+        Offers are public budgets. Confirmed payouts require matching wallet receipts; these totals are not your wallet balance.
+      </p>
+      {error && <div role="alert" className="card" style={{ padding: 16, marginBottom: 20 }}>
+        <p style={{ fontSize: 14, marginBottom: 10 }}>{error}</p>
+        <button className="btn btn-outline" onClick={loadAll}>Try again</button>
+      </div>}
 
       {/* Quick actions */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' }}>
         <Link href="/jobs/new" className="btn btn-primary"><Plus size={15} /> Post a Job</Link>
         <Link href="/jobs" className="btn btn-outline"><Briefcase size={15} /> Explore Jobs</Link>
-        <a href="https://faucet.zecpages.com/" target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ fontSize: 13 }}>Claim testnet ZEC <ExternalLink size={12} /></a>
+        <a href="https://z.cash/wallets/" target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ fontSize: 13 }}>Find a Zcash wallet <ExternalLink size={12} /></a>
       </div>
 
       {/* Tabs */}
@@ -104,7 +124,7 @@ export default function DashboardPage() {
         {tabs.map((t) => (
           <button
             key={t.k}
-            onClick={() => setTab(t.k as any)}
+            onClick={() => setTabSelection({ role, tab: t.k })}
             style={{
               padding: '10px 18px', fontSize: 14, background: 'none', border: 'none', cursor: 'pointer',
               fontWeight: tab === t.k ? 700 : 500,
@@ -117,7 +137,7 @@ export default function DashboardPage() {
         ))}
       </div>
 
-      {loading ? (
+      {error ? null : loading ? (
         <div style={{ display: 'grid', gap: 12 }}>{[1, 2].map((i) => <div key={i} className="card shimmer" style={{ height: 150 }} />)}</div>
       ) : (
         <>
@@ -128,7 +148,7 @@ export default function DashboardPage() {
           ))}
 
           {tab === 'working' && (working.length === 0 ? (
-            <Empty icon={Briefcase} title="No active work" desc="Browse open jobs and start earning ZEC." cta={{ href: '/jobs', label: 'Explore Jobs' }} />
+            <Empty icon={Briefcase} title="No active work" desc="Browse public jobs and their offered ZEC budgets." cta={{ href: '/jobs', label: 'Explore Jobs' }} />
           ) : (
             <div style={{ display: 'grid', gap: 12 }}>{working.map((j) => <JobCard key={j.id} job={j} currentAddress={address} />)}</div>
           ))}
@@ -158,7 +178,20 @@ export default function DashboardPage() {
   )
 }
 
-function Empty({ icon: Icon, title, desc, cta }: { icon: any; title: string; desc: string; cta: { href: string; label: string } }) {
+async function fetchDashboardData(signal?: AbortSignal): Promise<{
+  jobs: { posted?: Job[]; working?: Job[] }
+  apps: { applications?: Application[] }
+}> {
+  const [jobsRes, appsRes] = await Promise.all([
+    fetch('/api/jobs?mine=1', { signal }),
+    fetch('/api/applications', { signal }),
+  ])
+  if (!jobsRes.ok || !appsRes.ok) throw new Error('Dashboard data is unavailable.')
+  const [jobs, apps] = await Promise.all([jobsRes.json(), appsRes.json()])
+  return { jobs, apps }
+}
+
+function Empty({ icon: Icon, title, desc, cta }: { icon: LucideIcon; title: string; desc: string; cta: { href: string; label: string } }) {
   return (
     <div className="card" style={{ padding: '60px 40px', textAlign: 'center' }}>
       <Icon size={36} style={{ color: 'var(--muted)', margin: '0 auto 12px', opacity: 0.6 }} />

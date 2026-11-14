@@ -23,7 +23,7 @@ export function HeroClient() {
     <section
       id="hero-root"
       style={{
-        minHeight: 'calc(100vh - 66px)',
+        minHeight: 'calc(100vh - 72px)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -42,7 +42,6 @@ export function HeroClient() {
           height: 'min(820px, 115vw)',
           pointerEvents: 'none',
         }}
-        className="float"
       >
         <Globe style={{ width: '100%', height: '100%' }} />
       </div>
@@ -77,7 +76,7 @@ export function HeroClient() {
             }}
           >
             <Zap size={14} fill="currentColor" />
-            GenLayer AI · Zcash Privacy
+            GenLayer work review · Zcash testnet vault
           </span>
         </div>
 
@@ -92,11 +91,11 @@ export function HeroClient() {
         >
           <span className="hero-line">
             <span className="hero-line-i" style={{ color: 'var(--text)' }}>
-              Hire anyone.
+              Fund the brief.
             </span>
           </span>
           <span className="hero-line">
-            <span className="hero-line-i gradient-text">Pay privately.</span>
+            <span className="hero-line-i gradient-text">Judge the work.</span>
           </span>
         </h1>
 
@@ -111,9 +110,9 @@ export function HeroClient() {
             fontWeight: 400,
           }}
         >
-          The freelance marketplace where <strong style={{ color: 'var(--text)' }}>AI judges the work</strong> and
-          payments settle through <strong style={{ color: 'var(--text)' }}>private Zcash escrow</strong>. No
-          arbitrators. No exposed transactions.
+          Fund a public task. <strong style={{ color: 'var(--text)' }}>GenLayer reviews the delivered text</strong> against
+          agreed criteria. Accepted workers request <strong style={{ color: 'var(--text)' }}>shielded testnet payouts</strong> from
+          an operator-custodied Zcash vault.
         </p>
 
         <div

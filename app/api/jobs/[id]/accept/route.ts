@@ -1,40 +1,51 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getJob, updateJob } from '@/lib/store'
 import { notify } from '@/lib/notify'
+import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
+import { acceptJobOnChain, acknowledgeAssignment, GenLayerBusyError, withJobOperation } from '@/lib/genlayer'
 
-// Direct-mode: a freelancer self-accepts an open job.
+export const maxDuration = 180
+
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params
   try {
-    const { workerAddress } = await req.json()
-    if (!workerAddress) return NextResponse.json({ error: 'Worker address required' }, { status: 400 })
-
-    const job = await getJob(id)
-    if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
-    if (job.assignmentMode !== 'direct')
-      return NextResponse.json({ error: 'This job requires an application' }, { status: 400 })
-    if (job.status !== 'open') return NextResponse.json({ error: 'Job is not open' }, { status: 400 })
-    if (job.clientAddress === workerAddress)
-      return NextResponse.json({ error: 'Cannot accept your own job' }, { status: 400 })
-
-    const updated = await updateJob(id, { workerAddress, status: 'in_progress' })
-
-    await notify({
-      to: job.clientAddress,
-      type: 'job_assigned',
-      title: 'Your job was accepted',
-      body: `${workerAddress.slice(0, 10)}… accepted "${job.title}" and started working.`,
-      link: `/jobs/${id}`,
+    const body = await req.json()
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'Invalid acceptance body')
+    if (body.workerAddress !== undefined && typeof body.workerAddress !== 'string') throw new ApiError(400, 'Invalid worker identity')
+    const actor = requireActor(req, body.workerAddress)
+    const { id } = await params
+    return await withJobOperation(id, async () => {
+      const job = await getJob(id)
+      if (!job) throw new ApiError(404, 'Job not found')
+      if (job.assignmentMode !== 'direct') throw new ApiError(400, 'This job requires an application')
+      if (job.status === 'in_progress' && job.workerAddress === actor) { await acknowledgeAssignment(job.genlayerContractAddress, actor); return NextResponse.json({ job }) }
+      if (job.status !== 'open' || job.workerAddress) throw new ApiError(400, 'Job is not open')
+      if (job.clientAddress === actor) throw new ApiError(400, 'Cannot accept your own job')
+      if (job.clientAddress.startsWith('legacy_')) throw new ApiError(400, 'Archived legacy jobs are read-only')
+      if (!job.fundedAt || job.fundedZatoshis < job.budgetZatoshis) throw new ApiError(400, 'Fund the job vault before accepting a worker')
+      if (!job.genlayerContractAddress) throw new ApiError(503, 'GenLayer contract is unavailable')
+      try {
+        await acceptJobOnChain(job.genlayerContractAddress, actor)
+      } catch (error) {
+        console.error('GenLayer acceptance failed:', error)
+        throw new ApiError(503, 'GenLayer acceptance failed: ' + (error instanceof Error ? error.message : 'Provider unavailable'))
+      }
+      let updated
+      try {
+        updated = await updateJob(id, { workerAddress: actor, status: 'in_progress' }, { status: 'open', workerAddress: '', clientAddress: job.clientAddress })
+        if (!updated) throw new Error('Job changed before acceptance could be saved')
+        await acknowledgeAssignment(job.genlayerContractAddress, actor)
+      } catch (error) {
+        console.error('Finalized acceptance persistence failed:', error)
+        throw new ApiError(503, 'Finalized acceptance could not be saved. Retry this job.')
+      }
+      await notify({
+        to: job.clientAddress, type: 'job_assigned', title: 'Your job was accepted',
+        body: 'The worker accepted "' + job.title + '". The GenLayer assignment finalized successfully.',
+        link: '/jobs/' + id,
+      }).catch((error) => console.error('Acceptance notification failed:', error))
+      return NextResponse.json({ job: updated })
     })
-
-    if (job.genlayerContractAddress) {
-      import('@/lib/genlayer')
-        .then(({ acceptJobOnChain }) => acceptJobOnChain(job.genlayerContractAddress, workerAddress))
-        .catch(console.error)
-    }
-
-    return NextResponse.json({ job: updated })
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 })
+  } catch (error) {
+    return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(503, error.message) : error)
   }
 }

@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { JobCard } from '@/components/JobCard'
 import { useWallet } from '@/components/WalletContext'
-import { Job, JobCategory, JOB_CATEGORIES } from '@/lib/types'
+import { Job, JOB_CATEGORIES } from '@/lib/types'
 import { Plus, Search, SlidersHorizontal, Briefcase } from 'lucide-react'
 
 export default function JobsPage() {

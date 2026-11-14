@@ -2,50 +2,29 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getJob, addApplication, getProfile } from '@/lib/store'
 import { notify } from '@/lib/notify'
 import { generateId } from '@/lib/utils'
-import { Application } from '@/lib/types'
+import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
+import type { Application } from '@/lib/types'
 
-// Application-mode: a freelancer applies to a job.
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params
   try {
-    const { applicantAddress, coverLetter, proposedPrice } = await req.json()
-    if (!applicantAddress) return NextResponse.json({ error: 'Applicant address required' }, { status: 400 })
-
+    const body: unknown = await req.json()
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'Invalid application.')
+    const fields = body as Record<string, unknown>
+    const actor = requireActor(req, fields.applicantAddress)
+    if (Object.keys(fields).some(key => !['applicantAddress', 'coverLetter', 'proposedPrice'].includes(key))) throw new ApiError(400, 'Invalid application fields.')
+    if (fields.coverLetter !== undefined && (typeof fields.coverLetter !== 'string' || fields.coverLetter.length > 5000)) throw new ApiError(400, 'Use a cover letter under 5000 characters.')
+    const { id } = await params
     const job = await getJob(id)
-    if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
-    if (job.assignmentMode !== 'application')
-      return NextResponse.json({ error: 'This job is direct-assignment only' }, { status: 400 })
-    if (job.status !== 'open') return NextResponse.json({ error: 'Job is no longer open' }, { status: 400 })
-    if (job.clientAddress === applicantAddress)
-      return NextResponse.json({ error: 'Cannot apply to your own job' }, { status: 400 })
-    if ((job.applications ?? []).some((a) => a.applicantAddress === applicantAddress))
-      return NextResponse.json({ error: 'You already applied to this job' }, { status: 400 })
-
-    const profile = await getProfile(applicantAddress)
-
-    const application: Application = {
-      id: generateId(),
-      jobId: id,
-      applicantAddress,
-      applicantName: profile?.displayName || '',
-      coverLetter: coverLetter ?? '',
-      proposedPrice: proposedPrice ? parseFloat(proposedPrice) : job.budgetZec,
-      status: 'pending',
-      createdAt: new Date().toISOString(),
-    }
-
+    if (!job) throw new ApiError(404, 'Job not found')
+    if (job.assignmentMode !== 'application' || job.status !== 'open') throw new ApiError(400, 'This job is not accepting applications.')
+    if (job.clientAddress === actor) throw new ApiError(400, 'Cannot apply to your own job.')
+    if (job.applications.some(application => application.applicantAddress === actor)) throw new ApiError(409, 'You already applied to this job.')
+    const price = fields.proposedPrice === undefined || fields.proposedPrice === '' ? job.budgetZec : Number(fields.proposedPrice)
+    if (!['undefined', 'number', 'string'].includes(typeof fields.proposedPrice) || !Number.isFinite(price) || price <= 0 || price > 21_000_000) throw new ApiError(400, 'Use a positive ZEC proposed price.')
+    const profile = await getProfile(actor)
+    const application: Application = {id: generateId(), jobId: id, applicantAddress: actor, applicantName: profile?.displayName || '', coverLetter: fields.coverLetter as string ?? '', proposedPrice: price, status: 'pending', createdAt: new Date().toISOString()}
     await addApplication(application)
-
-    await notify({
-      to: job.clientAddress,
-      type: 'application_received',
-      title: 'New application received',
-      body: `${application.applicantName || applicantAddress.slice(0, 10) + '…'} applied to "${job.title}".`,
-      link: `/jobs/${id}`,
-    })
-
+    await notify({to: job.clientAddress, type: 'application_received', title: 'New application received', body: (application.applicantName || 'A freelancer') + ' applied to "' + job.title + '".', link: '/jobs/' + id}).catch(() => console.error('Application notification unavailable'))
     return NextResponse.json({ application })
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 })
-  }
+  } catch (error) { return apiErrorResponse(error) }
 }

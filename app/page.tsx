@@ -13,7 +13,7 @@ export default function HomePage() {
         <div className="marquee-track">
           {[...Array(2)].map((_, dup) => (
             <div key={dup} style={{ display: 'flex', gap: 48, paddingRight: 48, whiteSpace: 'nowrap' }}>
-              {['AI-Judged Escrow', 'Shielded Payments', 'No Arbitrators', 'Trustless', 'GenLayer Powered', 'Private by Default', 'Instant Settlement'].map((t) => (
+              {['Frozen acceptance criteria', 'Verified testnet funding', 'Three review attempts', 'Explicit worker claims', 'Operator-custodied vault', 'Public work briefs', 'Shielded payouts'].map((t) => (
                 <span key={t} style={{ fontSize: 14, fontWeight: 600, color: 'var(--muted-2)', display: 'flex', alignItems: 'center', gap: 48 }}>
                   {t} <span style={{ color: 'var(--primary)' }}>✦</span>
                 </span>
@@ -29,19 +29,19 @@ export default function HomePage() {
           <Reveal>
             <div className="text-center" style={{ marginBottom: 60 }}>
               <h2 style={{ fontSize: 'clamp(30px,5vw,44px)', fontWeight: 800, marginBottom: 14, letterSpacing: '-0.02em' }}>
-                Freelancing, <span className="gradient-text">reimagined</span>
+                Make work acceptance <span className="gradient-text">explicit</span>
               </h2>
               <p style={{ color: 'var(--muted-2)', fontSize: 17, maxWidth: 520, margin: '0 auto' }}>
-                Three problems with Web3 work, solved in one platform.
+                A funded offer, useful feedback, and a clear claim path.
               </p>
             </div>
           </Reveal>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             {[
-              { icon: Brain, title: 'AI is the judge', desc: 'GenLayer Intelligent Contracts use LLM validator consensus to decide if work meets the brief. Objective, instant, no disputes.' },
-              { icon: Shield, title: 'Payments stay private', desc: 'Every settlement runs through Zcash shielded transactions. Nobody sees who paid whom, how much, or for what.' },
-              { icon: Lock, title: 'Escrow from day one', desc: 'ZEC is locked before work begins. Funds release automatically the moment AI approves — no running off with deposits.' },
+              { icon: Brain, title: 'Review each criterion', desc: 'GenLayer evaluates the actual text against a frozen public rubric. Read specific feedback and revise within a three-review limit. Studio is a development environment.' },
+              { icon: Shield, title: 'Fund before work starts', desc: 'The job opens after the operator wallet verifies the exact testnet deposit and memo. Shielded transfers hide payment fields on chain; briefs, offers, and deposit requests remain public.' },
+              { icon: Lock, title: 'Claim after acceptance', desc: 'The accepted worker explicitly requests a payout. An existing operator Zallet wallet signs it, and matching wallet confirmation completes the job. This vault uses operator custody.' },
             ].map((f, i) => (
               <Reveal key={f.title} variant="up" delay={i * 120}>
                 <div className="card" style={{ padding: 32, height: '100%' }}>
@@ -116,15 +116,15 @@ export default function HomePage() {
           <Reveal>
             <div className="text-center" style={{ marginBottom: 60 }}>
               <h2 style={{ fontSize: 'clamp(28px,5vw,40px)', fontWeight: 800, marginBottom: 12 }}>How it works</h2>
-              <p style={{ color: 'var(--muted-2)', fontSize: 16 }}>From brief to private payout in four steps.</p>
+              <p style={{ color: 'var(--muted-2)', fontSize: 16 }}>From a funded brief to an accepted, confirmed payout.</p>
             </div>
           </Reveal>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
             {[
-              { n: '01', t: 'Post & fund escrow', d: 'Describe the task and deposit ZEC into the job’s shielded escrow address.' },
+              { n: '01', t: 'Post and fund the brief', d: 'Define public criteria and an exact budget. Fund the reserved testnet vault request from your wallet; work starts after verified confirmation.' },
               { n: '02', t: 'Assign or get applications', d: 'Choose direct assignment or review applicants and pick your freelancer.' },
-              { n: '03', t: 'Submit to the AI', d: 'The freelancer submits work. GenLayer validators evaluate it against your brief in seconds.' },
-              { n: '04', t: 'Instant private payout', d: 'If approved, ZEC releases to the freelancer’s shielded address. If not, they get feedback and resubmit.' },
+              { n: '03', t: 'Review, then revise if needed', d: 'Paste the actual deliverable. GenLayer reviews each criterion; linked pages are not fetched. There are three successful reviews, with a final nonpassing result closing the job.' },
+              { n: '04', t: 'Request the shielded payout', d: 'Accepted workers claim through the operator wallet. Rejected or cancelled funded jobs allow a client refund request. Transfers complete only after matching wallet confirmation.' },
             ].map((s, i) => (
               <Reveal key={s.n} delay={i * 80}>
                 <div className="card" style={{ padding: '24px 28px', display: 'flex', gap: 20, alignItems: 'center' }}>
@@ -162,14 +162,14 @@ export default function HomePage() {
           >
             <div style={{ fontSize: 52, marginBottom: 16 }}>⚡</div>
             <h2 style={{ fontSize: 'clamp(28px,5vw,40px)', fontWeight: 800, marginBottom: 12 }}>
-              Start in under a minute
+              Start with a clear brief
             </h2>
             <p style={{ color: 'var(--muted-2)', fontSize: 16, marginBottom: 32, maxWidth: 440, margin: '0 auto 32px' }}>
-              Generate a Zcash testnet wallet, claim free ZEC, and post or find work.
+              Connect your existing wallet by signing a challenge. Fund a public testnet task or find work with clear acceptance criteria.
             </p>
             <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
               <Link href="/onboarding" className="btn btn-primary" style={{ fontSize: 15, padding: '13px 30px' }}>
-                Create Wallet <ArrowRight size={16} />
+                Connect Wallet <ArrowRight size={16} />
               </Link>
               <Link href="/jobs" className="btn btn-dark" style={{ fontSize: 15, padding: '13px 30px' }}>
                 Browse Jobs

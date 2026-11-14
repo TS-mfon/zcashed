@@ -1,7 +1,11 @@
-import { NextResponse } from 'next/server'
-import { getAllJobs, getAllProfiles, hasSupabase } from '@/lib/store'
+import { NextRequest, NextResponse } from 'next/server'
+import { getAllJobs, getAllProfiles, storageBackend } from '@/lib/store'
+import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  try {
+  const actor = requireActor(req)
+  if (!(process.env.ADMIN_USER_IDS || '').split(',').map(id => id.trim()).includes(actor)) throw new ApiError(403, 'Administrator access is not authorized for this session.')
   const [jobs, profiles] = await Promise.all([getAllJobs(), getAllProfiles()])
 
   const totalVolume = jobs
@@ -26,7 +30,8 @@ export async function GET() {
       clients: profiles.filter((p) => p.role === 'client').length,
       totalVolume,
       escrowLocked,
-      backend: hasSupabase() ? 'Supabase' : 'Local file-DB',
+      backend: storageBackend(),
     },
-  })
+  }, { headers: { 'Cache-Control': 'private, no-store' } })
+  } catch (error) { return apiErrorResponse(error) }
 }

@@ -15,9 +15,9 @@ const geistMono = Geist_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'ZCashed — AI-Judged Private Freelance Payments',
+  title: 'ZCashed — Work Acceptance and Shielded Testnet Vaults',
   description:
-    'Hire talent and pay privately with Zcash. AI judges work completion — no middlemen, no exposed payments.',
+    'Fund public freelance tasks, evaluate delivered text with GenLayer, and explicitly claim shielded Zcash testnet payouts through an operator vault.',
   icons: {
     icon: '/favicon.ico',
   },
@@ -35,7 +35,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             className="py-6 text-center text-sm"
           >
             <span style={{ color: 'var(--muted)' }}>
-              ZCashed © 2024 — Powered by{' '}
+              ZCashed © 2026 — Built with{' '}
               <a
                 href="https://www.genlayer.com"
                 target="_blank"

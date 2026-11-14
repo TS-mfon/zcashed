@@ -3,15 +3,20 @@ export type Role = 'freelancer' | 'client' | 'admin'
 export type AssignmentMode = 'direct' | 'application'
 
 export type JobStatus =
+  | 'funding_required'
   | 'open'
   | 'in_progress'
   | 'under_review'
   | 'needs_revision'
   | 'approved'
+  | 'claiming'
+  | 'refunding'
+  | 'refunded'
+  | 'rejected'
   | 'completed'
   | 'cancelled'
 
-export type SubmissionStatus = 'pending' | 'reviewing' | 'approved' | 'rejected'
+export type SubmissionStatus = 'pending' | 'reviewing' | 'approved' | 'rejected' | 'needs_revision' | 'inconclusive'
 
 export type ApplicationStatus = 'pending' | 'accepted' | 'rejected'
 
@@ -42,11 +47,15 @@ export interface Job {
   description: string
   category: string
   budgetZec: number
+  budgetZatoshis: number
   assignmentMode: AssignmentMode
   clientAddress: string
-  escrowAddress: string
-  escrowPrivKey: string
   workerAddress: string
+  vaultAddress: string
+  vaultReference: string
+  vaultNetwork: 'testnet'
+  fundedAt: string | null
+  fundedZatoshis: number
   status: JobStatus
   genlayerContractAddress: string
   deadline: string | null

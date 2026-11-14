@@ -1,88 +1,85 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getAllJobs, createJob, getJobsByClient, getJobsByWorker } from '@/lib/store'
-import { generateZcashTestnetAddress } from '@/lib/zcash'
 import { generateId } from '@/lib/utils'
-import { Job } from '@/lib/types'
+import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
+import { deployEscrowContract } from '@/lib/genlayer'
+import { createJobVault } from '@/lib/vault'
+import { JOB_CATEGORIES, type Job } from '@/lib/types'
+
+export const maxDuration = 180
+const MAX_ZATOSHIS = 21_000_000 * 100_000_000
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url)
-  const address = searchParams.get('address')
-
-  if (address) {
-    const [posted, working] = await Promise.all([
-      getJobsByClient(address),
-      getJobsByWorker(address),
-    ])
-    return NextResponse.json({ posted, working })
+  try {
+    const address = new URL(req.url).searchParams.get('address')
+    if (address) {
+      requireActor(req, address)
+      const [posted, working] = await Promise.all([getJobsByClient(address), getJobsByWorker(address)])
+      return NextResponse.json({ posted, working })
+    }
+    return NextResponse.json({ jobs: await getAllJobs() })
+  } catch (error) {
+    return apiErrorResponse(error)
   }
-
-  const jobs = await getAllJobs()
-  return NextResponse.json({ jobs })
 }
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const {
-      title,
-      description,
-      category,
-      budgetZec,
-      deadline,
-      clientAddress,
-      assignmentMode,
-    } = body
-
-    if (!title?.trim()) return NextResponse.json({ error: 'Title is required' }, { status: 400 })
-    if (!description?.trim()) return NextResponse.json({ error: 'Description is required' }, { status: 400 })
-    if (!clientAddress) return NextResponse.json({ error: 'Client address is required' }, { status: 400 })
-    if (!budgetZec || budgetZec <= 0) return NextResponse.json({ error: 'Valid budget required' }, { status: 400 })
-
-    const escrow = await generateZcashTestnetAddress()
-
-    const job: Job = {
-      id: generateId(),
-      title: title.trim(),
-      description: description.trim(),
-      category: category ?? 'Other',
-      budgetZec: parseFloat(budgetZec),
-      assignmentMode: assignmentMode === 'direct' ? 'direct' : 'application',
-      clientAddress,
-      escrowAddress: escrow.address,
-      escrowPrivKey: escrow.privateKeyHex,
-      workerAddress: '',
-      status: 'open',
-      genlayerContractAddress: '',
-      deadline: deadline || null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      submissions: [],
-      applications: [],
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'Invalid job body')
+    if (body.clientAddress !== undefined && typeof body.clientAddress !== 'string') throw new ApiError(400, 'Invalid client identity')
+    const clientAddress = requireActor(req, body.clientAddress)
+    const offer = jobInput(body)
+    const id = generateId()
+    let vault: Awaited<ReturnType<typeof createJobVault>>
+    try { vault = await createJobVault(id) }
+    catch (error) {
+      console.error('Job vault creation failed:', error)
+      throw new ApiError(503, 'Testnet vault creation failed: ' + (error instanceof Error ? error.message : 'Wallet unavailable'))
     }
-
-    deployContractAsync(job)
+    let genlayerContractAddress: string
+    try {
+      genlayerContractAddress = await deployEscrowContract({ taskTitle: offer.title, taskDescription: offer.description })
+    } catch (error) {
+      console.error('GenLayer deployment failed:', error)
+      throw new ApiError(503, 'GenLayer deployment failed: ' + (error instanceof Error ? error.message : 'Provider unavailable'))
+    }
+    const now = new Date().toISOString()
+    const job: Job = {
+      ...offer, id, clientAddress, workerAddress: '', status: 'funding_required',
+      vaultAddress: vault.address, vaultReference: vault.reference, vaultNetwork: vault.network, fundedAt: null, fundedZatoshis: 0,
+      genlayerContractAddress, createdAt: now, updatedAt: now, submissions: [], applications: [],
+    }
     await createJob(job)
-    return NextResponse.json({ job })
-  } catch (err: any) {
-    console.error('POST /api/jobs error:', err)
-    return NextResponse.json({ error: err.message ?? 'Internal error' }, { status: 500 })
+    return NextResponse.json({ job }, { status: 201 })
+  } catch (error) {
+    return apiErrorResponse(error)
   }
 }
 
-async function deployContractAsync(job: Job) {
-  try {
-    const { deployEscrowContract } = await import('@/lib/genlayer')
-    const { updateJob } = await import('@/lib/store')
-    const contractAddress = await deployEscrowContract({
-      taskTitle: job.title,
-      taskDescription: job.description,
-      budgetZec: job.budgetZec.toString(),
-      clientAddress: job.clientAddress,
-      escrowZcashAddress: job.escrowAddress,
-    })
-    await updateJob(job.id, { genlayerContractAddress: contractAddress })
-    console.log(`GenLayer contract deployed for job ${job.id}: ${contractAddress}`)
-  } catch (err) {
-    console.error(`Failed to deploy GenLayer contract for job ${job.id}:`, err)
+function jobInput(body: Record<string, unknown>) {
+  const title = boundedText(body.title, 'Title', 1, 200)
+  const description = boundedText(body.description, 'Public requirements', 20, 12000)
+  if (description.split('\n').filter((line) => line.trim()).length > 12) throw new ApiError(400, 'Use one to twelve public rubric lines')
+  const budgetZatoshis = body.budgetZatoshis
+  if (typeof budgetZatoshis !== 'number' || !Number.isSafeInteger(budgetZatoshis) ||
+      budgetZatoshis <= 0 || budgetZatoshis > MAX_ZATOSHIS) throw new ApiError(400, 'Valid budget in integer zatoshis required')
+  const category = body.category ?? 'Other'
+  if (typeof category !== 'string' || !JOB_CATEGORIES.includes(category as typeof JOB_CATEGORIES[number])) throw new ApiError(400, 'Invalid category')
+  const assignmentMode = body.assignmentMode ?? 'application'
+  if (assignmentMode !== 'direct' && assignmentMode !== 'application') throw new ApiError(400, 'Invalid assignment mode')
+  let deadline: string | null = null
+  if (body.deadline !== undefined && body.deadline !== null && body.deadline !== '') {
+    if (typeof body.deadline !== 'string' || !Number.isFinite(Date.parse(body.deadline))) throw new ApiError(400, 'Invalid deadline')
+    deadline = new Date(body.deadline).toISOString()
   }
+  return { title, description, budgetZatoshis, budgetZec: budgetZatoshis / 100_000_000,
+    category, assignmentMode: assignmentMode as Job['assignmentMode'], deadline }
+}
+
+function boundedText(value: unknown, label: string, minimum: number, maximum: number): string {
+  if (typeof value !== 'string' || value.trim().length < minimum || value.trim().length > maximum) {
+    throw new ApiError(400, label + ' must contain ' + minimum + '-' + maximum + ' characters')
+  }
+  return value.trim()
 }

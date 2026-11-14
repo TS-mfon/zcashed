@@ -1,12 +1,8 @@
 import { NextResponse } from 'next/server'
-import { generateZcashTestnetAddress } from '@/lib/zcash'
 
 export async function POST() {
-  try {
-    const wallet = await generateZcashTestnetAddress()
-    return NextResponse.json(wallet)
-  } catch (err: any) {
-    console.error('Wallet generation error:', err)
-    return NextResponse.json({ error: err.message ?? 'Failed to generate wallet' }, { status: 500 })
-  }
+  return NextResponse.json(
+    { error: 'Wallet generation is disabled. Connect your existing Zcash wallet and approve payments in that wallet.' },
+    { status: 410, headers: { 'Cache-Control': 'no-store' } },
+  )
 }

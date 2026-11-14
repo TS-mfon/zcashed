@@ -1,319 +1,238 @@
-import { getSupabase, hasSupabase } from './supabase'
-import { fileJobs, fileProfiles, fileNotifications } from './filedb'
-import {
-  Job,
-  Profile,
-  Application,
-  Submission,
-  Notification,
-} from './types'
+import type { Db, Document, UpdateFilter } from 'mongodb'
+import { getMongoDatabase, storageBackend } from './mongodb'
+import { fileJobs, fileProfiles, fileNotifications, normalizeJob, normalizeProfile,
+  normalizeApplication, normalizeSubmission, normalizeNotification, requireUserId,
+  assertMutableJob, patchedJob, matchesExpectation, jobExpectation, assertOpenApplications,
+  assignedJob, reviewedJob, type JobExpectation } from './filedb'
+import type { Job, Profile, Application, Submission, Notification } from './types'
 
-// ---------- Row mappers (Supabase snake_case <-> camelCase) ----------
-function jobFromRow(r: any, apps: Application[] = [], subs: Submission[] = []): Job {
-  return {
-    id: r.id,
-    title: r.title,
-    description: r.description,
-    category: r.category,
-    budgetZec: Number(r.budget_zec),
-    assignmentMode: r.assignment_mode,
-    clientAddress: r.client_address,
-    escrowAddress: r.escrow_address,
-    escrowPrivKey: r.escrow_privkey,
-    workerAddress: r.worker_address ?? '',
-    status: r.status,
-    genlayerContractAddress: r.genlayer_contract_address ?? '',
-    deadline: r.deadline,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-    applications: apps,
-    submissions: subs,
-  }
-}
-function jobToRow(j: Partial<Job>): any {
-  const row: any = {}
-  if (j.id !== undefined) row.id = j.id
-  if (j.title !== undefined) row.title = j.title
-  if (j.description !== undefined) row.description = j.description
-  if (j.category !== undefined) row.category = j.category
-  if (j.budgetZec !== undefined) row.budget_zec = j.budgetZec
-  if (j.assignmentMode !== undefined) row.assignment_mode = j.assignmentMode
-  if (j.clientAddress !== undefined) row.client_address = j.clientAddress
-  if (j.escrowAddress !== undefined) row.escrow_address = j.escrowAddress
-  if (j.escrowPrivKey !== undefined) row.escrow_privkey = j.escrowPrivKey
-  if (j.workerAddress !== undefined) row.worker_address = j.workerAddress
-  if (j.status !== undefined) row.status = j.status
-  if (j.genlayerContractAddress !== undefined) row.genlayer_contract_address = j.genlayerContractAddress
-  if (j.deadline !== undefined) row.deadline = j.deadline
-  if (j.createdAt !== undefined) row.created_at = j.createdAt
-  if (j.updatedAt !== undefined) row.updated_at = j.updatedAt
-  return row
-}
-function appFromRow(r: any): Application {
-  return {
-    id: r.id,
-    jobId: r.job_id,
-    applicantAddress: r.applicant_address,
-    applicantName: r.applicant_name ?? '',
-    coverLetter: r.cover_letter ?? '',
-    proposedPrice: Number(r.proposed_price ?? 0),
-    status: r.status,
-    createdAt: r.created_at,
-  }
-}
-function subFromRow(r: any): Submission {
-  return {
-    id: r.id,
-    jobId: r.job_id,
-    workerAddress: r.worker_address,
-    submissionUrl: r.submission_url,
-    notes: r.notes ?? '',
-    status: r.status,
-    aiFeedback: r.ai_feedback ?? '',
-    attempt: r.attempt ?? 1,
-    genlayerTxHash: r.genlayer_tx_hash ?? '',
-    createdAt: r.created_at,
-  }
-}
-function notifFromRow(r: any): Notification {
-  return {
-    id: r.id,
-    recipientAddress: r.recipient_address,
-    type: r.type,
-    title: r.title,
-    body: r.body ?? '',
-    link: r.link ?? '',
-    read: r.read,
-    createdAt: r.created_at,
-  }
-}
-function profFromRow(r: any): Profile {
-  return {
-    address: r.address,
-    displayName: r.display_name ?? '',
-    role: r.role,
-    bio: r.bio ?? '',
-    skills: r.skills ?? [],
-    createdAt: r.created_at,
-  }
-}
+export { storageBackend }
+export type { JobExpectation }
+type JobDocument = Job & { _id: string }
+type ProfileDocument = Profile & { _id: string }
+type NotificationDocument = Notification & { _id: string }
 
-async function hydrateJob(sb: any, row: any): Promise<Job> {
-  const [{ data: apps }, { data: subs }] = await Promise.all([
-    sb.from('applications').select('*').eq('job_id', row.id),
-    sb.from('submissions').select('*').eq('job_id', row.id),
-  ])
-  return jobFromRow(
-    row,
-    (apps ?? []).map(appFromRow),
-    (subs ?? []).map(subFromRow),
-  )
+async function database(): Promise<Db | null> {
+  storageBackend()
+  return getMongoDatabase()
 }
-
-// ============================ JOBS ============================
-export async function getAllJobs(): Promise<Job[]> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb.from('jobs').select('*').order('created_at', { ascending: false })
-    return Promise.all((data ?? []).map((r) => hydrateJob(sb, r)))
-  }
-  return fileJobs.all()
+async function mongoOperation<T>(operation: string, action: () => Promise<T>): Promise<T> {
+  try { return await action() }
+  catch { throw new Error('MongoDB storage operation failed: ' + operation) }
 }
-
-export async function getJob(id: string): Promise<Job | null> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb.from('jobs').select('*').eq('id', id).maybeSingle()
-    if (!data) return null
-    return hydrateJob(sb, data)
-  }
-  return fileJobs.get(id)
+function acknowledged(result: { acknowledged: boolean }): void {
+  if (!result.acknowledged) throw new Error('MongoDB did not acknowledge the storage write')
 }
-
-export async function createJob(job: Job): Promise<Job> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('jobs').insert(jobToRow(job))
-    return job
-  }
-  fileJobs.save(job)
+async function mongoJob(db: Db, id: string): Promise<Job | null> {
+  const row = await mongoOperation('read job', () => db.collection<JobDocument>('jobs').findOne({ _id: id }))
+  return row ? normalizeJob(row) : null
+}
+async function mutableJob(db: Db, id: string): Promise<Job> {
+  const job = await mongoJob(db, id)
+  if (!job) throw new Error('Job is missing')
+  assertMutableJob(job)
   return job
 }
 
-export async function updateJob(id: string, updates: Partial<Job>): Promise<Job | null> {
-  const sb = getSupabase()
-  if (sb) {
-    const row = jobToRow(updates)
-    row.updated_at = new Date().toISOString()
-    await sb.from('jobs').update(row).eq('id', id)
-    return getJob(id)
-  }
-  return fileJobs.update(id, updates)
+export async function getAllJobs(): Promise<Job[]> {
+  const db = await database()
+  if (!db) return fileJobs.all()
+  const rows = await mongoOperation('list jobs', () => db.collection<JobDocument>('jobs').find({}).sort({ createdAt: -1 }).toArray())
+  return rows.map(normalizeJob)
 }
-
+export async function getJob(id: string): Promise<Job | null> {
+  const db = await database()
+  return db ? mongoJob(db, id) : fileJobs.get(id)
+}
+export async function createJob(value: Job): Promise<Job> {
+  const job = normalizeJob(value)
+  assertMutableJob(job)
+  const db = await database()
+  if (!db) { fileJobs.save(job); return job }
+  const result = await mongoOperation('create job', () => db.collection<JobDocument>('jobs').insertOne({ ...job, _id: job.id }))
+  acknowledged(result)
+  return job
+}
+export async function updateJob(id: string, updates: Partial<Job>, expected?: JobExpectation): Promise<Job | null> {
+  const conditions = jobExpectation(expected)
+  const db = await database()
+  if (!db) return fileJobs.update(id, updates, conditions)
+  const current = await mongoJob(db, id)
+  if (!current || !matchesExpectation(current, conditions)) return null
+  const next = patchedJob(current, updates)
+  const keys = Object.keys(updates).filter((key) => key !== 'id' && key !== 'clientAddress')
+  const patch = Object.fromEntries(keys.filter((key) => Object.hasOwn(next, key)).map((key) => [key, next[key as keyof Job]]))
+  const set = { ...patch, ...(updates.budgetZec !== undefined || updates.budgetZatoshis !== undefined ?
+    { budgetZec: next.budgetZec, budgetZatoshis: next.budgetZatoshis } : {}), updatedAt: next.updatedAt }
+  const result = await mongoOperation('update job', () => db.collection<JobDocument>('jobs').findOneAndUpdate(
+    { _id: id, ...conditions }, { $set: set }, { returnDocument: 'after', includeResultMetadata: false }))
+  return result ? normalizeJob(result) : null
+}
 export async function getJobsByClient(address: string): Promise<Job[]> {
-  return (await getAllJobs()).filter((j) => j.clientAddress === address)
+  const db = await database()
+  if (!db) return fileJobs.all().filter((job) => job.clientAddress === address)
+  const rows = await mongoOperation('list client jobs', () => db.collection<JobDocument>('jobs').find({ clientAddress: address }).sort({ createdAt: -1 }).toArray())
+  return rows.map(normalizeJob)
 }
-
 export async function getJobsByWorker(address: string): Promise<Job[]> {
-  return (await getAllJobs()).filter((j) => j.workerAddress === address)
+  const db = await database()
+  if (!db) return fileJobs.all().filter((job) => job.workerAddress === address)
+  const rows = await mongoOperation('list worker jobs', () => db.collection<JobDocument>('jobs').find({ workerAddress: address }).sort({ createdAt: -1 }).toArray())
+  return rows.map(normalizeJob)
 }
 
-// ============================ APPLICATIONS ============================
-export async function addApplication(app: Application): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('applications').insert({
-      id: app.id,
-      job_id: app.jobId,
-      applicant_address: app.applicantAddress,
-      applicant_name: app.applicantName,
-      cover_letter: app.coverLetter,
-      proposed_price: app.proposedPrice,
-      status: app.status,
-      created_at: app.createdAt,
-    })
+export async function addApplication(value: Application): Promise<void> {
+  const app = normalizeApplication(value)
+  requireUserId(app.applicantAddress)
+  const db = await database()
+  if (!db) {
+    if (!fileJobs.addApplication(app.jobId, app)) throw new Error('Job is missing')
     return
   }
-  fileJobs.addApplication(app.jobId, app)
+  assertOpenApplications(await mutableJob(db, app.jobId))
+  const result = await mongoOperation('add application', () => db.collection<JobDocument>('jobs').updateOne(
+    { _id: app.jobId, status: 'open', assignmentMode: 'application', 'applications.id': { $ne: app.id }, 'applications.applicantAddress': { $ne: app.applicantAddress } },
+    { $push: { applications: app }, $set: { updatedAt: new Date().toISOString() } }))
+  acknowledged(result)
+  if (result.matchedCount !== 1) throw new Error('Job is missing or application already exists')
 }
 
-export async function updateApplication(
-  jobId: string,
-  appId: string,
-  updates: Partial<Application>,
-): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    const row: any = {}
-    if (updates.status !== undefined) row.status = updates.status
-    await sb.from('applications').update(row).eq('id', appId)
+export async function assignJob(id: string, applicationId: string, clientActor: string): Promise<Job | null> {
+  requireUserId(clientActor)
+  const db = await database()
+  if (!db) return fileJobs.assign(id, applicationId, clientActor)
+  const current = await mongoJob(db, id)
+  if (!current) return null
+  const next = assignedJob(current, applicationId, clientActor)
+  if (!next) return null
+  const pipeline: Document[] = [{ $set: { workerAddress: { $literal: next.workerAddress }, status: 'in_progress',
+    updatedAt: { $literal: next.updatedAt }, applications: { $map: { input: '$applications', as: 'app',
+      in: { $mergeObjects: ['$$app', { status: { $cond: [{ $eq: ['$$app.id', { $literal: applicationId }] }, 'accepted', 'rejected'] } }] } } } } }]
+  const row = await mongoOperation('assign job', () => db.collection<JobDocument>('jobs').findOneAndUpdate(
+    { _id: id, clientAddress: clientActor, workerAddress: '', status: 'open', assignmentMode: 'application',
+      applications: { $elemMatch: { id: applicationId, applicantAddress: next.workerAddress, status: 'pending' } } },
+    pipeline, { returnDocument: 'after', includeResultMetadata: false }))
+  return row ? normalizeJob(row) : null
+}
+export async function recordJobReview(id: string, value: Submission, newStatus: Job['status'], workerActor: string): Promise<Job | null> {
+  requireUserId(workerActor)
+  const db = await database()
+  if (!db) return fileJobs.recordReview(id, value, newStatus, workerActor)
+  const current = await mongoJob(db, id)
+  if (!current) return null
+  const next = reviewedJob(current, value, newStatus, workerActor)
+  if (!next || next === current) return next
+  const sub = normalizeSubmission(value)
+  const existing = { $ifNull: ['$submissions', []] }
+  const terminal = { $and: [{ $ne: [{ $literal: newStatus }, 'approved'] }, { $gte: [{ $size: existing }, 2] }] }
+  const pipeline: Document[] = [{ $set: { status: { $cond: [terminal, 'rejected', { $literal: newStatus }] }, updatedAt: { $literal: next.updatedAt },
+    submissions: { $concatArrays: [existing, [{ $mergeObjects: [{ $literal: sub }, {
+      attempt: { $add: [{ $size: existing }, 1] }, status: { $cond: [terminal, 'rejected', { $literal: sub.status }] },
+    }] }]] } } }]
+  const row = await mongoOperation('record review', () => db.collection<JobDocument>('jobs').findOneAndUpdate(
+    { _id: id, workerAddress: workerActor, status: { $in: ['in_progress', 'needs_revision'] },
+      'submissions.id': { $ne: sub.id }, 'submissions.genlayerTxHash': { $ne: sub.genlayerTxHash }, $expr: { $lt: [{ $size: existing }, 3] } }, pipeline,
+    { returnDocument: 'after', includeResultMetadata: false }))
+  if (row) return normalizeJob(row)
+  const latest = await mongoJob(db, id)
+  return latest?.submissions.some((entry) => entry.id === sub.id || entry.genlayerTxHash === sub.genlayerTxHash) ? reviewedJob(latest, sub, newStatus, workerActor) : null
+}
+export async function updateApplication(jobId: string, appId: string, updates: Partial<Application>): Promise<void> {
+  const db = await database()
+  if (!db) {
+    if (!fileJobs.updateApplication(jobId, appId, updates)) throw new Error('Job is missing')
     return
   }
-  fileJobs.updateApplication(jobId, appId, updates)
+  const job = await mutableJob(db, jobId)
+  const app = job.applications.find((entry) => entry.id === appId)
+  if (!app) throw new Error('Application is missing')
+  const next = normalizeApplication({ ...app, ...updates, id: appId, jobId, applicantAddress: app.applicantAddress })
+  const set = Object.fromEntries(Object.keys(updates).filter((key) =>
+    ['status', 'coverLetter', 'applicantName', 'proposedPrice'].includes(key)).map((key) => ['applications.$.' + key, next[key as keyof Application]]))
+  const result = await mongoOperation('update application', () => db.collection<JobDocument>('jobs').updateOne(
+    { _id: jobId, 'applications.id': appId }, { $set: { ...set, updatedAt: new Date().toISOString() } }))
+  acknowledged(result)
+  if (result.matchedCount !== 1) throw new Error('Application is missing')
 }
-
 export async function getApplicationsByApplicant(address: string): Promise<Application[]> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb
-      .from('applications')
-      .select('*')
-      .eq('applicant_address', address)
-      .order('created_at', { ascending: false })
-    return (data ?? []).map(appFromRow)
-  }
-  const jobs = fileJobs.all()
-  return jobs
-    .flatMap((j) => j.applications ?? [])
-    .filter((a) => a.applicantAddress === address)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+  const db = await database()
+  const jobs = db ? (await mongoOperation('list applications', () => db.collection<JobDocument>('jobs')
+    .find({ 'applications.applicantAddress': address }).toArray())).map(normalizeJob) : fileJobs.all()
+  return jobs.flatMap((job) => job.applications).filter((app) => app.applicantAddress === address)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 
-// ============================ SUBMISSIONS ============================
-export async function addSubmission(sub: Submission): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('submissions').upsert({
-      id: sub.id,
-      job_id: sub.jobId,
-      worker_address: sub.workerAddress,
-      submission_url: sub.submissionUrl,
-      notes: sub.notes,
-      status: sub.status,
-      ai_feedback: sub.aiFeedback,
-      attempt: sub.attempt,
-      genlayer_tx_hash: sub.genlayerTxHash,
-      created_at: sub.createdAt,
-    })
+export async function addSubmission(value: Submission): Promise<void> {
+  const sub = normalizeSubmission(value)
+  requireUserId(sub.workerAddress)
+  const db = await database()
+  if (!db) {
+    if (!fileJobs.addSubmission(sub.jobId, sub)) throw new Error('Job is missing')
     return
   }
-  fileJobs.addSubmission(sub.jobId, sub)
+  await mutableJob(db, sub.jobId)
+  // One atomic pipeline replaces only this ID and preserves concurrent submissions.
+  const pipeline: Document[] = [{ $set: { submissions: { $concatArrays: [
+    { $filter: { input: { $ifNull: ['$submissions', []] }, as: 'entry', cond: { $ne: ['$$entry.id', { $literal: sub.id }] } } },
+    [{ $literal: sub }],
+  ] }, updatedAt: { $literal: new Date().toISOString() } } }]
+  const result = await mongoOperation('upsert submission', () => db.collection<JobDocument>('jobs').updateOne({ _id: sub.jobId }, pipeline))
+  acknowledged(result)
+  if (result.matchedCount !== 1) throw new Error('Job is missing')
 }
 
-// ============================ PROFILES ============================
 export async function getProfile(address: string): Promise<Profile | null> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb.from('profiles').select('*').eq('address', address).maybeSingle()
-    return data ? profFromRow(data) : null
-  }
-  return fileProfiles.get(address)
+  const db = await database()
+  if (!db) return fileProfiles.get(address)
+  const row = await mongoOperation('read profile', () => db.collection<ProfileDocument>('profiles').findOne({ _id: address }))
+  return row ? normalizeProfile(row) : null
 }
-
-export async function upsertProfile(profile: Profile): Promise<Profile> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('profiles').upsert({
-      address: profile.address,
-      display_name: profile.displayName,
-      role: profile.role,
-      bio: profile.bio,
-      skills: profile.skills,
-      created_at: profile.createdAt,
-    })
-    return profile
-  }
-  return fileProfiles.upsert(profile)
+export async function upsertProfile(value: Profile): Promise<Profile> {
+  const profile = normalizeProfile(value)
+  requireUserId(profile.address)
+  const db = await database()
+  if (!db) return fileProfiles.upsert(profile)
+  const result = await mongoOperation('upsert profile', () => db.collection<ProfileDocument>('profiles').replaceOne(
+    { _id: profile.address }, profile, { upsert: true }))
+  acknowledged(result)
+  return profile
 }
-
 export async function getAllProfiles(): Promise<Profile[]> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb.from('profiles').select('*').order('created_at', { ascending: false })
-    return (data ?? []).map(profFromRow)
-  }
-  return fileProfiles.all()
+  const db = await database()
+  if (!db) return fileProfiles.all()
+  const rows = await mongoOperation('list profiles', () => db.collection<ProfileDocument>('profiles').find({}).sort({ createdAt: -1 }).toArray())
+  return rows.map(normalizeProfile)
 }
 
-// ============================ NOTIFICATIONS ============================
-export async function addNotification(n: Notification): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('notifications').insert({
-      id: n.id,
-      recipient_address: n.recipientAddress,
-      type: n.type,
-      title: n.title,
-      body: n.body,
-      link: n.link,
-      read: n.read,
-      created_at: n.createdAt,
-    })
-    return
-  }
-  fileNotifications.add(n)
+export async function addNotification(value: Notification): Promise<void> {
+  const note = normalizeNotification(value)
+  requireUserId(note.recipientAddress)
+  const db = await database()
+  if (!db) { fileNotifications.add(note); return }
+  const result = await mongoOperation('create notification', () => db.collection<NotificationDocument>('notifications').insertOne({ ...note, _id: note.id }))
+  acknowledged(result)
 }
-
 export async function getNotifications(address: string): Promise<Notification[]> {
-  const sb = getSupabase()
-  if (sb) {
-    const { data } = await sb
-      .from('notifications')
-      .select('*')
-      .eq('recipient_address', address)
-      .order('created_at', { ascending: false })
-    return (data ?? []).map(notifFromRow)
-  }
-  return fileNotifications.forUser(address)
+  const db = await database()
+  if (!db) return fileNotifications.forUser(address)
+  const rows = await mongoOperation('list notifications', () => db.collection<NotificationDocument>('notifications')
+    .find({ recipientAddress: address }).sort({ createdAt: -1 }).toArray())
+  return rows.map(normalizeNotification)
 }
-
-export async function markNotificationRead(id: string): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('notifications').update({ read: true }).eq('id', id)
-    return
-  }
-  fileNotifications.markRead(id)
+export async function markNotificationRead(id: string, address: string): Promise<boolean> {
+  requireUserId(address)
+  const db = await database()
+  if (!db) return fileNotifications.markRead(id, address)
+  const result = await mongoOperation('mark notification read', () => db.collection<NotificationDocument>('notifications').updateOne(
+    { _id: id, recipientAddress: address }, { $set: { read: true } }))
+  acknowledged(result)
+  return result.matchedCount === 1
 }
-
 export async function markAllNotificationsRead(address: string): Promise<void> {
-  const sb = getSupabase()
-  if (sb) {
-    await sb.from('notifications').update({ read: true }).eq('recipient_address', address)
-    return
-  }
-  fileNotifications.markAllRead(address)
+  requireUserId(address)
+  const db = await database()
+  if (!db) { fileNotifications.markAllRead(address); return }
+  const result = await mongoOperation('mark notifications read', () => db.collection<NotificationDocument>('notifications').updateMany(
+    { recipientAddress: address }, { $set: { read: true } } as UpdateFilter<NotificationDocument>))
+  acknowledged(result)
 }
-
-export { hasSupabase }

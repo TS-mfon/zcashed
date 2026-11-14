@@ -30,11 +30,16 @@ export function timeAgo(dateStr: string): string {
 
 export function statusLabel(status: JobStatus): string {
   const labels: Record<JobStatus, string> = {
+    funding_required: 'Awaiting Funding',
     open: 'Open',
     in_progress: 'In Progress',
     under_review: 'Under Review',
     needs_revision: 'Needs Revision',
     approved: 'Approved',
+    claiming: 'Payment Pending',
+    refunding: 'Refund Pending',
+    refunded: 'Refunded',
+    rejected: 'Rejected',
     completed: 'Completed',
     cancelled: 'Cancelled',
   }
@@ -43,11 +48,16 @@ export function statusLabel(status: JobStatus): string {
 
 export function statusColor(status: JobStatus): string {
   const colors: Record<JobStatus, string> = {
+    funding_required: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
     open: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
     in_progress: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
     under_review: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
     needs_revision: 'bg-orange-500/15 text-orange-400 border-orange-500/30',
     approved: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+    claiming: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+    refunding: 'bg-orange-500/15 text-orange-400 border-orange-500/30',
+    refunded: 'bg-gray-500/15 text-gray-400 border-gray-500/30',
+    rejected: 'bg-red-500/15 text-red-400 border-red-500/30',
     completed: 'bg-purple-500/15 text-purple-400 border-purple-500/30',
     cancelled: 'bg-red-500/15 text-red-400 border-red-500/30',
   }

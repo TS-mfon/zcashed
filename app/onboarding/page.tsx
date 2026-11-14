@@ -2,252 +2,150 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { useWallet } from '@/components/WalletContext'
-import { Role } from '@/lib/types'
-import {
-  Wallet, Copy, CheckCircle, Eye, EyeOff, ExternalLink, AlertCircle,
-  Briefcase, PenTool, Loader2, ArrowRight, ArrowLeft,
-} from 'lucide-react'
+import { useWallet, WalletChallenge } from '@/components/WalletContext'
+import { ZcashNetwork } from '@/lib/zcash'
+import { Briefcase, PenTool, Loader2, ArrowRight, ArrowLeft, ShieldCheck, Wallet, Copy, Check, LockKeyhole } from 'lucide-react'
+
+const fieldStyle = { width: '100%', padding: '12px 14px', fontSize: 14 }
+const labelStyle = { display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7 } as const
+const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`
 
 export default function OnboardingPage() {
   const router = useRouter()
-  const { address, generateWallet, setAddress, saveProfile } = useWallet()
-
-  const [step, setStep] = useState<1 | 2 | 3>(1)
-  const [role, setRole] = useState<Role>('freelancer')
-  const [displayName, setDisplayName] = useState('')
-  const [bio, setBio] = useState('')
-  const [skills, setSkills] = useState('')
-  const [generatedKey, setGeneratedKey] = useState<string | null>(null)
-  const [manualAddress, setManualAddress] = useState('')
-  const [showKey, setShowKey] = useState(false)
-  const [copied, setCopied] = useState(false)
-  const [generating, setGenerating] = useState(false)
+  const { walletAddress, network: connectedNetwork, profile, beginConnection, verifyConnection, clearWallet, saveProfile, isConnected, isLoading, error: sessionError } = useWallet()
+  const [stage, setStage] = useState<'wallet' | 'signature' | 'profile'>('wallet')
+  const [walletInput, setWalletInput] = useState('')
+  const [network, setNetwork] = useState<ZcashNetwork>('testnet')
+  const [challenge, setChallenge] = useState<WalletChallenge | null>(null)
+  const [signature, setSignature] = useState('')
+  const [roleChoice, setRoleChoice] = useState<'freelancer' | 'client' | null>(null)
+  const [nameInput, setNameInput] = useState<string | null>(null)
+  const [bioInput, setBioInput] = useState<string | null>(null)
+  const [skillsInput, setSkillsInput] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [copied, setCopied] = useState<string | null>(null)
+  const activeStage = isConnected ? 'profile' : stage === 'profile' ? 'wallet' : stage
+  const activeIndex = activeStage === 'wallet' ? 0 : activeStage === 'signature' ? 1 : 2
+  const role = roleChoice ?? (profile?.role === 'client' ? 'client' : 'freelancer')
+  const displayName = nameInput ?? profile?.displayName ?? ''
+  const bio = bioInput ?? profile?.bio ?? ''
+  const skills = skillsInput ?? profile?.skills.join(', ') ?? ''
 
-  function copy(t: string) {
-    navigator.clipboard.writeText(t)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1800)
-  }
-
-  async function handleGenerate() {
-    setGenerating(true)
+  async function startConnection(event: React.FormEvent) {
+    event.preventDefault()
     setError('')
-    const res = await generateWallet()
-    if (res) setGeneratedKey(res.privateKeyHex)
-    else setError('Failed to generate wallet. Try again.')
-    setGenerating(false)
+    const address = walletInput.trim()
+    const prefix = network === 'testnet' ? 'tm' : 't1'
+    if (!address.startsWith(prefix)) { setError(`Use an existing ${network} P2PKH address starting with ${prefix}, or select the matching network.`); return }
+    const next = await beginConnection(address)
+    if (next) { setChallenge(next); setSignature(''); setCopied(null); setStage('signature') }
   }
 
-  function handleManual() {
-    if (!manualAddress.trim()) return
-    setAddress(manualAddress.trim())
+  async function confirmSignature(event: React.FormEvent) {
+    event.preventDefault()
+    if (!challenge || !signature.trim()) { setError('Paste the signature returned by your wallet.'); return }
+    setError('')
+    const connected = await verifyConnection(challenge.challengeToken, signature.trim())
+    if (connected) { setSignature(''); setChallenge(null); setStage('profile') }
   }
 
-  async function finish() {
+  async function finish(event: React.FormEvent) {
+    event.preventDefault()
     setSaving(true)
+    setError('')
     const saved = await saveProfile({
       role,
-      displayName: displayName.trim() || (role === 'client' ? 'Anonymous Client' : 'Anonymous Freelancer'),
+      displayName: displayName.trim() || (role === 'client' ? 'Client' : 'Freelancer'),
       bio: bio.trim(),
-      skills: skills.split(',').map((s) => s.trim()).filter(Boolean),
+      skills: role === 'freelancer' ? skills.split(',').map((skill) => skill.trim()).filter(Boolean) : [],
     })
     setSaving(false)
     if (saved) router.push(role === 'client' ? '/jobs/new' : '/jobs')
   }
 
-  const steps = ['Role', 'Wallet', 'Profile']
+  async function copy(value: string, label: string) {
+    try { await navigator.clipboard.writeText(value); setCopied(label); setError('') }
+    catch { setError('Clipboard unavailable. Select and copy the complete text manually.') }
+  }
+
+  async function switchWallet() {
+    await clearWallet()
+    setStage('wallet')
+    setChallenge(null)
+    setSignature('')
+    setNameInput(null)
+    setBioInput(null)
+    setSkillsInput(null)
+    setRoleChoice(null)
+  }
+
+  const rpc = challenge ? JSON.stringify({ jsonrpc: '2.0', id: 'zcashed-connect', method: 'signmessage', params: [walletInput.trim(), challenge.message] }, null, 2) : ''
+  const command = challenge ? `zcash-cli${network === 'testnet' ? ' -testnet' : ''} signmessage ${shellQuote(walletInput.trim())} ${shellQuote(challenge.message)}` : ''
 
   return (
-    <div className="max-w-xl mx-auto px-4 py-12">
-      {/* Progress */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 32 }}>
-        {steps.map((label, i) => (
-          <div key={label} style={{ flex: 1 }}>
-            <div
-              style={{
-                height: 4,
-                borderRadius: 2,
-                background: step > i ? 'var(--primary)' : 'var(--border-2)',
-                transition: 'background .3s',
-              }}
-            />
-            <div style={{ fontSize: 11, color: step > i ? 'var(--primary-dark)' : 'var(--muted)', marginTop: 6, fontWeight: 600 }}>
-              {label}
-            </div>
-          </div>
-        ))}
+    <div className="max-w-3xl mx-auto px-4 py-12">
+      <div style={{ marginBottom: 28 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', color: 'var(--primary-dark)', fontSize: 11, fontWeight: 700, letterSpacing: '.08em', marginBottom: 10 }}><LockKeyhole size={14} /> WALLET CONNECTION</div>
+        <h1 style={{ fontSize: 30, fontWeight: 800, marginBottom: 8 }}>Connect your existing Zcash wallet</h1>
+        <p style={{ color: 'var(--muted-2)', fontSize: 15, lineHeight: 1.7, maxWidth: 620 }}>Use a wallet ownership signature to sign in. Keep spending keys in your wallet. Job deposits are held by the operator’s custodial testnet vault.</p>
       </div>
-
-      {/* Step 1: Role */}
-      {step === 1 && (
-        <div>
-          <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 6 }}>Welcome to ZCashed</h1>
-          <p style={{ color: 'var(--muted-2)', fontSize: 15, marginBottom: 28 }}>How do you want to use the platform?</p>
-
-          <div style={{ display: 'grid', gap: 14 }}>
-            {[
-              { r: 'freelancer' as Role, icon: PenTool, title: 'I’m a Freelancer', desc: 'Find work, apply to jobs, and earn private ZEC payments.' },
-              { r: 'client' as Role, icon: Briefcase, title: 'I’m a Client', desc: 'Post jobs, hire talent, and pay through AI-judged escrow.' },
-            ].map((opt) => (
-              <button
-                key={opt.r}
-                onClick={() => setRole(opt.r)}
-                className="card"
-                style={{
-                  padding: 22,
-                  textAlign: 'left',
-                  cursor: 'pointer',
-                  border: role === opt.r ? '2px solid var(--primary)' : '1px solid var(--border)',
-                  background: role === opt.r ? 'var(--primary-glow)' : 'var(--surface)',
-                  display: 'flex',
-                  gap: 16,
-                  alignItems: 'center',
-                }}
-              >
-                <div
-                  style={{
-                    width: 46, height: 46, borderRadius: 12, flexShrink: 0,
-                    background: role === opt.r ? 'var(--primary)' : 'var(--surface-2)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  }}
-                >
-                  <opt.icon size={22} color={role === opt.r ? '#1a1500' : 'var(--muted-2)'} />
-                </div>
-                <div>
-                  <div style={{ fontSize: 17, fontWeight: 700 }}>{opt.title}</div>
-                  <div style={{ fontSize: 13, color: 'var(--muted-2)', marginTop: 2 }}>{opt.desc}</div>
-                </div>
-              </button>
-            ))}
+      <ol aria-label="Connection progress" className="grid grid-cols-3 gap-2" style={{ listStyle: 'none', padding: 0, margin: '0 0 24px' }}>
+        {['Choose wallet', 'Sign message', 'Your profile'].map((label, index) => <li key={label} aria-current={index === activeIndex ? 'step' : undefined} style={{ borderTop: `3px solid ${index <= activeIndex ? 'var(--primary)' : 'var(--border-2)'}`, paddingTop: 10, display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, fontWeight: 600, color: index <= activeIndex ? 'var(--text)' : 'var(--muted)' }}><span>{index < activeIndex ? <Check size={15} /> : `${index + 1}.`}</span>{label}</li>)}
+      </ol>
+      {isLoading && activeStage === 'wallet' && <p role="status" style={{ fontSize: 13, color: 'var(--muted-2)', marginBottom: 12 }}>Checking your wallet session…</p>}
+      <div className="card" style={{ padding: 24 }}>
+        {activeStage === 'wallet' && <form onSubmit={startConnection} style={{ display: 'grid', gap: 20 }}>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}><Wallet size={26} style={{ color: 'var(--primary-dark)' }} /><div><h2 style={{ fontSize: 20, fontWeight: 700 }}>Choose a wallet you already control</h2><p style={{ color: 'var(--muted-2)', fontSize: 13, marginTop: 4 }}>Supported signing method: Zallet or zcashd <code>signmessage</code>.</p></div></div>
+          <div>
+            <label htmlFor="connect-network" style={labelStyle}>Wallet network</label>
+            <select id="connect-network" value={network} onChange={(event) => { setNetwork(event.target.value as ZcashNetwork); setError('') }} style={fieldStyle}><option value="testnet">Testnet</option><option value="mainnet">Mainnet</option></select>
           </div>
-
-          <button onClick={() => setStep(2)} className="btn btn-primary w-full" style={{ marginTop: 24, padding: 14 }}>
-            Continue <ArrowRight size={16} />
-          </button>
-        </div>
-      )}
-
-      {/* Step 2: Wallet */}
-      {step === 2 && (
-        <div>
-          <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 6 }}>Your Zcash Wallet</h1>
-          <p style={{ color: 'var(--muted-2)', fontSize: 15, marginBottom: 24 }}>Generate a testnet wallet, or connect an existing address.</p>
-
-          {!address ? (
-            <>
-              <button onClick={handleGenerate} disabled={generating} className="btn btn-primary w-full" style={{ padding: 14 }}>
-                {generating ? <Loader2 size={16} className="spin" /> : <Wallet size={16} />}
-                {generating ? 'Generating…' : 'Generate Testnet Wallet'}
-              </button>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '18px 0' }}>
-                <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
-                <span style={{ fontSize: 12, color: 'var(--muted)' }}>or</span>
-                <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
-              </div>
-
-              <div style={{ display: 'flex', gap: 10 }}>
-                <input
-                  placeholder="Paste existing address (tm…)"
-                  value={manualAddress}
-                  onChange={(e) => setManualAddress(e.target.value)}
-                  style={{ flex: 1, padding: '11px 14px', fontSize: 13, fontFamily: 'var(--font-geist-mono)' }}
-                />
-                <button onClick={handleManual} className="btn btn-outline" disabled={!manualAddress.trim()}>
-                  Connect
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="card" style={{ padding: 20, background: 'var(--primary-glow)', border: '1px solid rgba(245,184,0,0.4)' }}>
-              <div style={{ fontSize: 11, color: 'var(--muted-2)', fontWeight: 700, marginBottom: 6 }}>YOUR ADDRESS</div>
-              <div style={{ fontFamily: 'var(--font-geist-mono)', fontSize: 12, wordBreak: 'break-all', marginBottom: 8 }}>{address}</div>
-              <button onClick={() => copy(address)} className="btn btn-ghost" style={{ fontSize: 12, padding: '4px 8px' }}>
-                {copied ? <CheckCircle size={13} color="var(--primary-dark)" /> : <Copy size={13} />} {copied ? 'Copied' : 'Copy'}
-              </button>
-
-              {generatedKey && (
-                <div style={{ marginTop: 14, borderTop: '1px solid rgba(245,184,0,0.3)', paddingTop: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <span style={{ fontSize: 11, color: 'var(--muted-2)', fontWeight: 700 }}>PRIVATE KEY — SAVE IT!</span>
-                    <button onClick={() => setShowKey(!showKey)} className="btn btn-ghost" style={{ fontSize: 11, padding: '2px 6px' }}>
-                      {showKey ? <EyeOff size={12} /> : <Eye size={12} />} {showKey ? 'Hide' : 'Show'}
-                    </button>
-                  </div>
-                  <div style={{ fontFamily: 'var(--font-geist-mono)', fontSize: 11, wordBreak: 'break-all', color: showKey ? 'var(--primary-dark)' : 'var(--muted)' }}>
-                    {showKey ? generatedKey : '•'.repeat(40)}
-                  </div>
-                  <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', marginTop: 10, fontSize: 11, color: 'var(--muted-2)' }}>
-                    <AlertCircle size={13} style={{ color: 'var(--gold)', flexShrink: 0, marginTop: 1 }} />
-                    Store this safely. It controls your funds and can’t be recovered.
-                  </div>
-                </div>
-              )}
-
-              <div style={{ marginTop: 14 }}>
-                <div style={{ fontSize: 12, color: 'var(--muted-2)', marginBottom: 8 }}>Claim free testnet ZEC:</div>
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <a href="https://faucet.zecpages.com/" target="_blank" rel="noreferrer" className="btn btn-outline" style={{ fontSize: 12, padding: '6px 12px' }}>
-                    ZecPages <ExternalLink size={11} />
-                  </a>
-                  <a href="https://faucet.zcashfoundation.dev/" target="_blank" rel="noreferrer" className="btn btn-outline" style={{ fontSize: 12, padding: '6px 12px' }}>
-                    ZF Faucet <ExternalLink size={11} />
-                  </a>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {error && <p style={{ color: '#ef4444', fontSize: 13, marginTop: 12 }}>{error}</p>}
-
-          <div style={{ display: 'flex', gap: 10, marginTop: 24 }}>
-            <button onClick={() => setStep(1)} className="btn btn-ghost">
-              <ArrowLeft size={15} /> Back
-            </button>
-            <button onClick={() => setStep(3)} disabled={!address} className="btn btn-primary" style={{ flex: 1, padding: 13 }}>
-              Continue <ArrowRight size={16} />
-            </button>
+          <div>
+            <label htmlFor="connect-address" style={labelStyle}>Wallet sign-in address</label>
+            <input id="connect-address" value={walletInput} onChange={(event) => { setWalletInput(event.target.value); setError('') }} placeholder={network === 'testnet' ? 'Existing tm… address from your wallet' : 'Existing t1… address from your wallet'} required maxLength={120} autoComplete="off" spellCheck={false} style={{ ...fieldStyle, fontFamily: 'var(--font-geist-mono)', fontSize: 13 }} aria-describedby="signin-address-help" />
+            <p id="signin-address-help" style={{ color: 'var(--muted-2)', fontSize: 12, lineHeight: 1.7, marginTop: 8 }}>Use an existing transparent P2PKH address whose key your wallet can sign with. The server checks ownership; pasting an address alone does not connect a wallet. A shielded payout address is entered privately when work is approved.</p>
           </div>
-        </div>
-      )}
-
-      {/* Step 3: Profile */}
-      {step === 3 && (
-        <div>
-          <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 6 }}>Set up your profile</h1>
-          <p style={{ color: 'var(--muted-2)', fontSize: 15, marginBottom: 24 }}>A few details so others know who they’re working with.</p>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-            <div>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Display Name</label>
-              <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="e.g. Alex the Developer" style={{ width: '100%', padding: '12px 14px', fontSize: 14 }} />
-            </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Bio</label>
-              <textarea value={bio} onChange={(e) => setBio(e.target.value)} placeholder="Tell clients about your experience…" style={{ width: '100%', padding: '12px 14px', fontSize: 14, minHeight: 90, resize: 'vertical' }} />
-            </div>
-            {role === 'freelancer' && (
-              <div>
-                <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Skills (comma separated)</label>
-                <input value={skills} onChange={(e) => setSkills(e.target.value)} placeholder="React, Solidity, Design…" style={{ width: '100%', padding: '12px 14px', fontSize: 14 }} />
-              </div>
-            )}
+          <button type="submit" disabled={isLoading} className="btn btn-primary" style={{ minHeight: 46 }}>{isLoading ? <Loader2 size={16} className="spin" /> : <ArrowRight size={16} />} Continue to wallet signature</button>
+        </form>}
+        {activeStage === 'signature' && challenge && <form onSubmit={confirmSignature} style={{ display: 'grid', gap: 18 }}>
+          <div><h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 6 }}>Sign this message in your wallet</h2><p style={{ color: 'var(--muted-2)', fontSize: 13, lineHeight: 1.7 }}>Read the message and check that it names this site before signing. This signature is for connection only; it gives the app no spending authority.</p></div>
+          <div style={{ fontSize: 12, padding: 12, background: 'var(--surface-2)', borderRadius: 8, overflowWrap: 'anywhere' }}><strong>{network === 'testnet' ? 'Testnet' : 'Mainnet'}</strong> · {walletInput.trim()}</div>
+          <div>
+            <label htmlFor="connect-message" style={labelStyle}>Exact message to sign</label>
+            <textarea id="connect-message" value={challenge.message} readOnly rows={9} style={{ ...fieldStyle, fontFamily: 'var(--font-geist-mono)', fontSize: 12, overflowWrap: 'anywhere' }} />
+            <button type="button" onClick={() => { void copy(challenge.message, 'message') }} className="btn btn-outline" style={{ marginTop: 8, minHeight: 44 }}><Copy size={14} />{copied === 'message' ? 'Message copied' : 'Copy exact message'}</button>
           </div>
-
-          <div style={{ display: 'flex', gap: 10, marginTop: 24 }}>
-            <button onClick={() => setStep(2)} className="btn btn-ghost">
-              <ArrowLeft size={15} /> Back
-            </button>
-            <button onClick={finish} disabled={saving} className="btn btn-primary" style={{ flex: 1, padding: 13 }}>
-              {saving ? <Loader2 size={16} className="spin" /> : null}
-              {saving ? 'Saving…' : 'Finish & Enter ZCashed'}
-            </button>
+          <details style={{ fontSize: 13, color: 'var(--muted-2)' }}><summary style={{ cursor: 'pointer', padding: '8px 0', fontWeight: 600 }}>How to sign with Zallet or zcashd</summary>
+            <p style={{ fontSize: 12, lineHeight: 1.7, margin: '10px 0' }}>Use your existing local wallet RPC connection. For Zallet, call <code>signmessage</code> with these exact JSON-RPC parameters. Only the returned base64 signature belongs in the next field.</p>
+            <textarea aria-label="Zallet signmessage JSON-RPC request" value={rpc} readOnly rows={8} style={{ ...fieldStyle, fontFamily: 'var(--font-geist-mono)', fontSize: 11 }} />
+            <button type="button" onClick={() => { void copy(rpc, 'rpc') }} className="btn btn-outline" style={{ marginTop: 8, minHeight: 44 }}><Copy size={14} />{copied === 'rpc' ? 'RPC request copied' : 'Copy RPC request'}</button>
+            <p style={{ fontSize: 12, lineHeight: 1.7, margin: '16px 0 8px' }}>If you already use zcashd and its CLI, run this command locally:</p>
+            <textarea aria-label="zcash-cli signmessage command" value={command} readOnly rows={5} style={{ ...fieldStyle, fontFamily: 'var(--font-geist-mono)', fontSize: 11 }} />
+            <button type="button" onClick={() => { void copy(command, 'command') }} className="btn btn-outline" style={{ marginTop: 8, minHeight: 44 }}><Copy size={14} />{copied === 'command' ? 'Command copied' : 'Copy CLI command'}</button>
+          </details>
+          <div>
+            <label htmlFor="connect-signature" style={labelStyle}>Wallet signature</label>
+            <textarea id="connect-signature" value={signature} onChange={(event) => setSignature(event.target.value)} placeholder="Paste the base64 signature returned by signmessage" rows={3} required maxLength={200} autoComplete="off" spellCheck={false} style={{ ...fieldStyle, fontFamily: 'var(--font-geist-mono)', fontSize: 12 }} />
           </div>
-        </div>
-      )}
+          <p style={{ color: 'var(--muted)', fontSize: 12 }}>The challenge expires shortly. If it expires, go back to request a new message.</p>
+          <div className="flex flex-wrap gap-3"><button type="button" disabled={isLoading} onClick={() => { setStage('wallet'); setChallenge(null); setSignature(''); setError('') }} className="btn btn-outline" style={{ minHeight: 46 }}><ArrowLeft size={15} />Back</button><button type="submit" disabled={isLoading} className="btn btn-primary" style={{ flex: 1, minHeight: 46 }}>{isLoading ? <Loader2 size={16} className="spin" /> : <ShieldCheck size={16} />} Verify and connect wallet</button></div>
+        </form>}
+        {activeStage === 'profile' && <form onSubmit={finish} style={{ display: 'grid', gap: 20 }}>
+          <div style={{ display: 'flex', gap: 12, padding: 16, borderRadius: 10, background: 'var(--primary-glow)' }}><ShieldCheck size={22} style={{ color: 'var(--primary-dark)', flexShrink: 0 }} /><div><h2 style={{ fontSize: 16, fontWeight: 700 }}>Wallet ownership verified</h2><p style={{ fontSize: 12, color: 'var(--muted-2)', overflowWrap: 'anywhere', marginTop: 5 }}>{connectedNetwork} · {walletAddress}</p></div></div>
+          <div><h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 6 }}>Make yourself known</h2><p style={{ color: 'var(--muted-2)', fontSize: 13 }}>Choose a role and the name others will see on your work.</p></div>
+          <fieldset style={{ border: 0, padding: 0, margin: 0 }}><legend style={labelStyle}>I want to…</legend><div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {[{ value: 'freelancer' as const, icon: PenTool, title: 'Find work', description: 'Apply, deliver, and receive private ZEC payments.' }, { value: 'client' as const, icon: Briefcase, title: 'Hire talent', description: 'Post work and pay from your own Zcash wallet.' }].map((option) => <button key={option.value} type="button" aria-pressed={role === option.value} onClick={() => setRoleChoice(option.value)} style={{ padding: 18, textAlign: 'left', borderRadius: 10, border: role === option.value ? '2px solid var(--primary)' : '1px solid var(--border-2)', background: role === option.value ? 'var(--primary-glow)' : 'var(--surface)', minHeight: 105 }}><option.icon size={20} style={{ marginBottom: 8, color: 'var(--primary-dark)' }} /><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{option.title}</span><span style={{ display: 'block', fontSize: 12, color: 'var(--muted-2)', lineHeight: 1.6, marginTop: 4 }}>{option.description}</span></button>)}
+          </div></fieldset>
+          <div><label htmlFor="profile-name" style={labelStyle}>Display name</label><input id="profile-name" value={displayName} maxLength={100} onChange={(event) => setNameInput(event.target.value)} placeholder="e.g. Alex the Developer" style={fieldStyle} /></div>
+          <div><label htmlFor="profile-bio" style={labelStyle}>Bio</label><textarea id="profile-bio" value={bio} maxLength={2000} onChange={(event) => setBioInput(event.target.value)} placeholder="A few details about your work…" style={{ ...fieldStyle, minHeight: 90 }} /></div>
+          {role === 'freelancer' && <div><label htmlFor="profile-skills" style={labelStyle}>Skills (comma separated)</label><input id="profile-skills" value={skills} maxLength={1000} onChange={(event) => setSkillsInput(event.target.value)} placeholder="React, Design, Research…" style={fieldStyle} /></div>}
+          <button type="submit" disabled={saving || isLoading} className="btn btn-primary" style={{ minHeight: 46 }}>{saving ? <Loader2 size={16} className="spin" /> : <ArrowRight size={16} />}{saving ? 'Saving profile…' : role === 'client' ? 'Continue to post a job' : 'Continue to find work'}</button>
+          <button type="button" onClick={() => { void switchWallet() }} disabled={isLoading || saving} className="btn btn-ghost" style={{ minHeight: 44 }}>Use another wallet</button>
+        </form>}
+        {(error || sessionError) && <p role="alert" style={{ color: '#b91c1c', fontSize: 13, lineHeight: 1.6, marginTop: 16 }}>{error || sessionError}</p>}
+      </div>
+      <div style={{ display: 'flex', gap: 10, padding: '20px 4px', color: 'var(--muted-2)', fontSize: 12, lineHeight: 1.7 }}><LockKeyhole size={16} style={{ marginTop: 2, flexShrink: 0 }} /><p>The server receives your sign-in address to verify the signature. Public jobs use a separate application identity. Shielded payout addresses stay in private server records for the authorized vault payout.</p></div>
     </div>
   )
 }

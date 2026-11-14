@@ -1,142 +1,258 @@
-import { createClient, createAccount, generatePrivateKey, chains } from 'genlayer-js'
-import fs from 'fs'
-import path from 'path'
+import { createClient, createAccount } from 'genlayer-js'
+import { studionet } from 'genlayer-js/chains'
+import {
+  ExecutionResult,
+  TransactionHashVariant,
+  TransactionStatus,
+  transactionsStatusNameToNumber,
+  executionResultNumberToName,
+  type GenLayerTransaction,
+  type TransactionHash,
+} from 'genlayer-js/types'
+import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { acquireJobLease, releaseJobLease, readOperationJournal, reserveOperation, attachOperationHash, patchOperation, removeFailedOperation, GenLayerBusyError } from './genlayer-operations'
+export { GenLayerBusyError } from './genlayer-operations'
 
-const PRIVATE_KEY_FILE = path.join(process.cwd(), 'data', '.genlayer_key')
+export type CriterionDecision = {
+  id: string
+  status: 'passed' | 'failed' | 'inconclusive'
+  feedback: string
+}
 
-function getOrCreatePrivateKey(): `0x${string}` {
-  const envKey = process.env.GENLAYER_PRIVATE_KEY
-  if (envKey) return envKey as `0x${string}`
+export type Judgment = {
+  verdict: 'approved' | 'needs_revision' | 'inconclusive' | 'rejected'
+  reason: string
+  criteria: CriterionDecision[]
+}
 
-  if (fs.existsSync(PRIVATE_KEY_FILE)) {
-    const key = fs.readFileSync(PRIVATE_KEY_FILE, 'utf-8').trim()
-    if (key.startsWith('0x') && key.length === 66) return key as `0x${string}`
+class GenLayerExecutionError extends Error {}
+
+function operationKey(address: string, method: string, args: string[], scope: string): string {
+  return createHash('sha256').update(JSON.stringify([address.toLowerCase(), method, args, scope])).digest('hex')
+}
+
+async function resumeOperation(client: ReturnType<typeof getClient>, address: string, method: string, args: string[], scope = '') {
+  const key = operationKey(address, method, args, scope)
+  const journal = await readOperationJournal()
+  if (Object.entries(journal).some(([otherKey, entry]) => otherKey !== key && entry.address === address.toLowerCase() && (entry.pending || !entry.settled))) {
+    throw new GenLayerBusyError('A previous GenLayer transaction needs reconciliation. Retry its original public artifact first.')
   }
-
-  const newKey = generatePrivateKey()
-  if (!fs.existsSync(path.dirname(PRIVATE_KEY_FILE))) {
-    fs.mkdirSync(path.dirname(PRIVATE_KEY_FILE), { recursive: true })
+  const reservation = await reserveOperation(key, address.toLowerCase())
+  let hash = reservation.record.hash
+  if (!hash) {
+    if (!reservation.isNew) throw new GenLayerBusyError('A previous GenLayer transaction has an unknown dispatch outcome. Operator reconciliation is required before retrying.')
+    const dispatched = await client.writeContract({ address: contractAddress(address), functionName: method, args, value: 0n, leaderOnly: false })
+    if (typeof dispatched !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(dispatched)) throw new Error('GenLayer returned an invalid transaction hash')
+    await attachOperationHash(key, reservation.record.dispatchToken!, dispatched)
+    hash = dispatched
   }
-  fs.writeFileSync(PRIVATE_KEY_FILE, newKey)
-  return newKey
+  if (!hash) throw new Error('GenLayer transaction hash is unavailable; operator reconciliation is required')
+  try { await successfulFinalization(client, hash) }
+  catch (error) {
+    if (error instanceof GenLayerExecutionError) await removeFailedOperation(key)
+    throw error
+  }
+  return { key, hash }
+}
+
+async function completeOperation(key: string): Promise<void> {
+  await patchOperation(key, { pending: false })
+}
+
+export async function hasUnsettledJobOperation(address: string): Promise<boolean> {
+  const normalized = contractAddress(address).toLowerCase()
+  return Object.values(await readOperationJournal()).some((entry) => entry.address === normalized && (entry.pending || !entry.settled))
+}
+
+async function acknowledgeOperation(key: string): Promise<void> {
+  const entry = (await readOperationJournal())[key]
+  if (!entry) return
+  if (entry.pending) throw new Error('GenLayer transaction is still pending reconciliation')
+  await patchOperation(key, { settled: true })
+}
+
+export async function acknowledgeAssignment(address: string, actor: string): Promise<void> {
+  await acknowledgeOperation(operationKey(contractAddress(address), 'accept_job', [workerDemoId(actor)], ''))
+}
+
+export async function acknowledgeReview(address: string, content: string, actor: string, attempt: number): Promise<void> {
+  await acknowledgeOperation(operationKey(contractAddress(address), 'submit_work', [content.trim(), workerDemoId(actor)], String(attempt)))
+}
+
+export async function withJobOperation<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
+  const lease = await acquireJobLease(jobId)
+  try { return await operation() }
+  finally { await releaseJobLease(lease) }
+}
+
+function getPrivateKey(): `0x${string}` {
+  const key = process.env.GENLAYER_PRIVATE_KEY
+  if (!key || !/^0x[0-9a-fA-F]{64}$/.test(key)) {
+    throw new Error('Configure a valid GENLAYER_PRIVATE_KEY for the GenLayer Studio deployer')
+  }
+  return key as `0x${string}`
 }
 
 function getClient() {
-  const privateKey = getOrCreatePrivateKey()
-  const account = createAccount(privateKey)
-  return createClient({
-    chain: chains.studionet,
-    account,
-  })
+  return createClient({ chain: studionet, account: createAccount(getPrivateKey()) })
 }
 
-function getContractCode(): string {
-  const contractPath = path.join(process.cwd(), 'contracts', 'escrow.py')
-  return fs.readFileSync(contractPath, 'utf-8')
+function contractAddress(value: string): `0x${string}` {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) throw new Error('Missing or invalid GenLayer contract address')
+  return value as `0x${string}`
+}
+
+function workerDemoId(actor: string): string {
+  if (!actor?.trim()) throw new Error('Worker demo identity is required')
+  return 'worker:' + createHash('sha256').update(actor).digest('hex')
+}
+
+async function successfulFinalization(client: ReturnType<typeof getClient>, hash: string) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) throw new Error('GenLayer returned an invalid transaction hash')
+  const receipt = await client.waitForTransactionReceipt({
+    hash: hash as TransactionHash,
+    status: TransactionStatus.FINALIZED,
+    interval: 1500,
+    retries: 80,
+  })
+  const finalized = receipt.statusName === TransactionStatus.FINALIZED ||
+    receipt.status === TransactionStatus.FINALIZED ||
+    receipt.status === Number(transactionsStatusNameToNumber[TransactionStatus.FINALIZED])
+  if (!finalized) throw new Error('GenLayer transaction has not finalized: ' + hash)
+  if (!executionSucceeded(receipt)) {
+    if (executionFailed(receipt)) throw new GenLayerExecutionError('GenLayer contract execution failed: ' + hash)
+    throw new Error('GenLayer contract execution is unverified: ' + hash)
+  }
+  return receipt
+}
+
+function executionFailed(receipt: GenLayerTransaction): boolean {
+  if (receipt.txExecutionResultName !== undefined) return receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR
+  if (receipt.txExecutionResult !== undefined) return receipt.txExecutionResult === 2
+  return receipt.consensus_data?.leader_receipt?.some((leader) => leader.execution_result === 'ERROR') ?? false
+}
+
+function executionSucceeded(receipt: GenLayerTransaction): boolean {
+  // Stable chain receipts expose the named result or its documented numeric enum.
+  if (receipt.txExecutionResultName !== undefined) {
+    return receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_RETURN
+  }
+  if (receipt.txExecutionResult !== undefined) {
+    return executionResultNumberToName[String(receipt.txExecutionResult) as keyof typeof executionResultNumberToName] ===
+      ExecutionResult.FINISHED_WITH_RETURN
+  }
+  // Studio serializes Receipt.execution_result using ExecutionResultStatus.SUCCESS.
+  // Primary source: genlayer-studio/backend/node/types.py. Missing evidence fails closed.
+  const leaders = receipt.consensus_data?.leader_receipt
+  return Array.isArray(leaders) && leaders.length > 0 &&
+    leaders.every((leader) => leader.execution_result === 'SUCCESS')
 }
 
 export async function deployEscrowContract(params: {
   taskTitle: string
   taskDescription: string
-  budgetZec: string
-  clientAddress: string
-  escrowZcashAddress: string
 }): Promise<string> {
   const client = getClient()
-  const code = getContractCode()
-
-  const txHash = await client.deployContract({
+  const code = fs.readFileSync(path.join(process.cwd(), 'contracts', 'escrow.py'), 'utf8')
+  const hash = await client.deployContract({
     code,
-    args: [
-      params.taskTitle,
-      params.taskDescription,
-      params.budgetZec,
-      params.clientAddress,
-      params.escrowZcashAddress,
-    ],
+    args: [params.taskTitle, params.taskDescription],
     leaderOnly: false,
   })
-
-  const receipt = await client.waitForTransactionReceipt({ hash: txHash as any })
-  return (receipt as any).contractAddress as string
+  const receipt = await successfulFinalization(client, hash)
+  const deployed = receipt.data?.contract_address
+  if (typeof deployed !== 'string') throw new Error('Successful GenLayer receipt is missing the deployed contract address')
+  return contractAddress(deployed)
 }
 
-export async function acceptJobOnChain(
-  contractAddress: string,
-  workerAddress: string,
-): Promise<string> {
+export async function acceptJobOnChain(address: string, actor: string): Promise<string> {
   const client = getClient()
-
-  const txHash = await client.writeContract({
-    address: contractAddress as `0x${string}`,
-    functionName: 'accept_job',
-    args: [workerAddress],
-    value: 0n,
-    leaderOnly: false,
-  })
-
-  await client.waitForTransactionReceipt({ hash: txHash as any })
-  return txHash as string
+  const worker = workerDemoId(actor)
+  const { key, hash } = await resumeOperation(client, contractAddress(address), 'accept_job', [worker])
+  const state = await readState(client, address)
+  if (state.status !== 'in_progress' || state.worker_demo_id !== worker) throw new Error('Finalized GenLayer assignment does not match this worker')
+  await completeOperation(key)
+  return hash
 }
 
 export async function submitWorkOnChain(
-  contractAddress: string,
+  address: string,
   submissionContent: string,
-  workerAddress: string,
-): Promise<{ txHash: string; approved: boolean; rejectionReason: string }> {
+  actor: string,
+  requestedAttempt?: number,
+): Promise<Judgment & { txHash: string; approved: boolean; rejectionReason: string; attempt: number }> {
+  if (requestedAttempt !== undefined && (!Number.isSafeInteger(requestedAttempt) || requestedAttempt < 1 || requestedAttempt > 3)) throw new Error('GenLayer adjudication attempt must be between one and three')
   const client = getClient()
-
-  const txHash = await client.writeContract({
-    address: contractAddress as `0x${string}`,
-    functionName: 'submit_work',
-    args: [submissionContent, workerAddress],
-    value: 0n,
-    leaderOnly: false,
-  })
-
-  await client.waitForTransactionReceipt({ hash: txHash as any })
-
-  // Read state after submission to get AI verdict
-  const state = await readContractState(contractAddress)
-  const approved = state.status === 'approved'
-  const rejectionReason = state.rejection_reason ?? ''
-
-  return { txHash: txHash as string, approved, rejectionReason }
+  const content = submissionContent.trim()
+  const worker = workerDemoId(actor)
+  const { key, hash } = await resumeOperation(client, contractAddress(address), 'submit_work', [content, worker], String(requestedAttempt ?? ''))
+  const state = await readState(client, address)
+  if (state.current_submission !== content || state.worker_demo_id !== worker) {
+    throw new Error('Finalized GenLayer state does not match this submission')
+  }
+  if (requestedAttempt !== undefined && Number(state.submission_count) !== requestedAttempt) throw new Error('Finalized GenLayer adjudication count does not match this attempt')
+  const judgment = parseJudgment(state.judgment, state.rubric, state.submission_count)
+  if (state.status !== judgment.verdict) throw new Error('Finalized GenLayer status does not match its criterion decisions')
+  await completeOperation(key)
+  return {
+    ...judgment,
+    txHash: hash,
+    approved: judgment.verdict === 'approved',
+    rejectionReason: judgment.reason,
+    attempt: Number(state.submission_count),
+  }
 }
 
-export async function markPaidOnChain(
-  contractAddress: string,
-  txHash: string,
-): Promise<string> {
-  const client = getClient()
-
-  const hash = await client.writeContract({
-    address: contractAddress as `0x${string}`,
-    functionName: 'mark_paid',
-    args: [txHash],
-    value: 0n,
-    leaderOnly: false,
+function parseJudgment(raw: unknown, rubric: unknown, submissionCount: unknown): Judgment {
+  const count = typeof submissionCount === 'string' && /^[1-3]$/.test(submissionCount) ? Number(submissionCount) : submissionCount
+  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 1 || count > 3) throw new Error('GenLayer returned an invalid adjudication count')
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('GenLayer returned no valid judgment')
+  const result = raw as Record<string, unknown>
+  if (!Array.isArray(result.criteria) || !Array.isArray(rubric) || rubric.length === 0 ||
+      result.criteria.length !== rubric.length) throw new Error('GenLayer judgment is missing rubric decisions')
+  const expectedIds = rubric.map((item: unknown) => {
+    if (!item || typeof item !== 'object' || typeof (item as Record<string, unknown>).id !== 'string') {
+      throw new Error('GenLayer returned an invalid rubric')
+    }
+    return (item as { id: string }).id
   })
-
-  await client.waitForTransactionReceipt({ hash: hash as any })
-  return hash as string
+  const criteria = result.criteria.map((entry: unknown, index: number): CriterionDecision => {
+    if (!entry || typeof entry !== 'object') throw new Error('GenLayer returned an invalid criterion decision')
+    const criterion = entry as Record<string, unknown>
+    if (criterion.id !== expectedIds[index] ||
+        !['passed', 'failed', 'inconclusive'].includes(String(criterion.status)) ||
+        typeof criterion.feedback !== 'string' || !criterion.feedback.trim() || criterion.feedback.length > 500) {
+      throw new Error('GenLayer returned an invalid criterion decision')
+    }
+    return { id: criterion.id as string, status: criterion.status as CriterionDecision['status'], feedback: criterion.feedback }
+  })
+  if (new Set(expectedIds).size !== expectedIds.length) throw new Error('GenLayer rubric contains duplicate IDs')
+  const passed = criteria.every((entry) => entry.status === 'passed')
+  const verdict = passed ? 'approved' : count === 3 ? 'rejected' :
+    criteria.some((entry) => entry.status === 'inconclusive') ? 'inconclusive' : 'needs_revision'
+  if (result.verdict !== verdict || typeof result.reason !== 'string') throw new Error('GenLayer judgment contradicts its evidence')
+  const reason = criteria.filter((entry) => entry.status !== 'passed').map((entry) => entry.id + ': ' + entry.feedback).join('\n')
+  return { verdict, reason, criteria }
 }
 
-export async function readContractState(contractAddress: string): Promise<Record<string, any>> {
-  const client = getClient()
-
+async function readState(client: ReturnType<typeof getClient>, address: string): Promise<Record<string, unknown>> {
   const result = await client.readContract({
-    address: contractAddress as `0x${string}`,
+    address: contractAddress(address),
     functionName: 'get_state',
     args: [],
     jsonSafeReturn: true,
+    transactionHashVariant: TransactionHashVariant.LATEST_FINAL,
   })
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('GenLayer returned no finalized state')
+  return result as Record<string, unknown>
+}
 
-  return (result ?? {}) as Record<string, any>
+export async function readContractState(address: string): Promise<Record<string, unknown>> {
+  return readState(getClient(), address)
 }
 
 export function getGenLayerAccount(): string {
-  const privateKey = getOrCreatePrivateKey()
-  const account = createAccount(privateKey)
-  return account.address
+  return createAccount(getPrivateKey()).address
 }

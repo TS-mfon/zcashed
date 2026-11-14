@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ZCashed
 
-## Getting Started
+ZCashed connects public freelance work acceptance to a funded **Zcash testnet custodial vault**. GenLayer evaluates pasted deliverable text against a frozen rubric. A chosen worker can claim the offered amount only after a successful finalized verdict and verified full funding.
 
-First, run the development server:
+The vault uses an **existing operator Zallet wallet**. The app does not generate seeds or accounts, but its authenticated server RPC has spending authority. This is operator custody, not a trustless cross-chain escrow or a decentralized payment guarantee.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## Flow
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+1. Connect an existing Zcash wallet by signing a server challenge with a transparent P2PKH address. This proves that signing key, not control of a shielded payout address.
+2. Post a public task with one acceptance criterion per line and an exact zatoshi budget. The server requires a successful finalized GenLayer deployment and reserves a testnet Orchard deposit address.
+3. Fund the vault from a native wallet using the exact amount and opaque deposit-reference memo. The job opens only after the operator wallet verifies the matching shielded output with at least one confirmation. A URI or user-entered transaction hash is not funding evidence.
+4. A freelancer accepts an open task, or the client chooses an applicant. The freelancer pastes the actual deliverable text.
+5. GenLayer independently re-evaluates rubric decisions. Revisions are bounded to three successful reviews: the first two nonpassing reviews can be revised; the third nonpassing review is terminal. Provider failures never become approval.
+6. After approval, the assigned worker enters an Orchard-only testnet payout address and requests a claim. The server durably reserves the claim before asking Zallet to sign and broadcast a fully shielded payout. Completion requires a matching confirmed wallet receipt.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+An uncertain transfer is never automatically resent. The client can explicitly request a shielded refund for a verified funded job that is rejected or cancelled. A permanent per-job reservation prevents both a worker payout and a client refund. Operator recovery of unresolved transfers remains manual; live funding, payout, and refund verification are separate requirements.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Architecture
 
-## Learn More
+- **Next.js:** public jobs, signed-message wallet sessions, and authenticated funding/claim routes. Verified signing addresses yield opaque `user_…` application identities.
+- **GenLayer Studionet:** real LLM execution and configurable development consensus testing. The contract judges public text; it never holds or transfers ZEC. Studio execution does not establish independent production-network consensus. See [Studio limitations](https://docs.genlayer.com/developers/intelligent-contracts/tools/genlayer-studio/limitations).
+- **MongoDB:** public application metadata and a separate private `vault_operations` ledger. Job assignment and review recording use atomic updates. Production and durable vault operations require MongoDB; local file metadata is available only for one development/test process.
+- **Zallet:** an existing synchronized beta.4-compatible testnet wallet account, configured server-side. Deposits and outgoing receipts are checked against wallet evidence. The operator supplies spending authority, backups, unlock policy, and fees.
 
-To learn more about Next.js, take a look at the following resources:
+The historical [contracts/escrow.py](contracts/escrow.py) filename is a work-acceptance contract, not the Zcash custody mechanism.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Run locally
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Requires Node.js 20.9+ and npm. Run `npm ci`, copy [.env.example](.env.example) to `.env.local`, and supply the server configuration described in [SETUP.md](SETUP.md). Then run `npm run dev` and open <http://localhost:3000>.
 
-## Deploy on Vercel
+Real job creation and vault operations need `GENLAYER_PRIVATE_KEY`, `MONGODB_URI`, `SESSION_SECRET`, and the existing Zallet RPC/account configuration. No deployer key, Zcash seed, or wallet account should be auto-generated by the app. Keep all credentials server-side and out of source control.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Privacy and trust boundaries
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Briefs, budgets, deposit addresses/references, deliverable text, and verdicts are public application data. Shielded transfers do not make these public offers private.
+- A fully shielded transfer hides addresses, amount, and memo on the public chain. The operator wallet and private database still see payment details.
+- A claim sends the payout address to the server. The private vault ledger stores recipient, amount, opaque memo, operation state, and transaction ID; these are excluded from public jobs and GenLayer inputs. Authorized client/worker receipt views are private.
+- Login verifies a transparent signing key. It does not establish shielded-recipient ownership or compatibility with every native wallet.
+- Only pasted text is judged. URLs are references; the MVP does not fetch websites, execute code, or inspect attachments.
+- Legacy rows keep deterministic read-only pseudonyms. New wallet sessions cannot inherit their ownership; a scoped migration requires separate authorization.
+- The operator can spend wallet funds. A GenLayer verdict is not a cryptographic authorization enforced by Zcash. Mainnet, automated lost-broadcast recovery, and production operational assurance remain outside the verified MVP. Refunds require a client request and a confirmed matching wallet receipt.
+
+## Verification and differentiation
+
+Run the repository's test, typecheck, lint, and build scripts. File tests and mocked MongoDB/Zallet providers validate application behavior, not a connected cluster or real transfer. [HANDOFF.md](HANDOFF.md) tracks live verification and custody limitations.
+
+Private bounties and AI payment tools already exist. The useful distinction is frozen, criterion-level work acceptance, independent re-evaluation, bounded revisions, and a funded worker-claim gate. See [the source-backed comparison](docs/winner-differentiation.md) and [the demo brief](docs/demo-script.md); payment demonstrations must use the current funded vault flow described here.
