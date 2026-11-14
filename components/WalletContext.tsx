@@ -2,7 +2,10 @@
 
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 import { Profile } from '@/lib/types'
-import { ZcashNetwork } from '@/lib/zcash'
+import { ZcashNetwork, parseShieldedAddress } from '@/lib/zcash'
+import { BrowserWallet } from '@/lib/browser-wallet'
+import WalletPicker from './WalletPicker'
+import { useRouter } from 'next/navigation'
 
 interface WalletConnection {
   address: string
@@ -29,7 +32,8 @@ interface WalletContextType extends WalletState {
   role: string | null
   clearWallet: () => Promise<void>
   isConnected: boolean
-  beginConnection: (walletAddress: string) => Promise<WalletChallenge | null>
+  openWalletPicker: () => void
+  beginConnection: (walletAddress: string, unifiedAddress?: string) => Promise<WalletChallenge | null>
   verifyConnection: (challengeToken: string, signature: string) => Promise<WalletConnection | null>
   refreshProfile: () => Promise<void>
   saveProfile: (data: Partial<Profile>) => Promise<Profile | null>
@@ -42,8 +46,10 @@ const message = (cause: unknown) => cause instanceof Error ? cause.message : 'Th
 function readConnection(data: Record<string, unknown>): WalletConnection | null {
   if (data.address === null) return null
   if (typeof data.address !== 'string' || !data.address || typeof data.walletAddress !== 'string' || !data.walletAddress
-    || (data.network !== 'mainnet' && data.network !== 'testnet')) throw new Error('The server returned an invalid wallet session.')
-  return { address: data.address, walletAddress: data.walletAddress, network: data.network }
+    || data.network !== 'testnet') throw new Error('This app requires a testnet wallet session.')
+  const recipient = parseShieldedAddress(data.walletAddress, 'testnet')
+  if (!recipient.address.startsWith('utest1')) throw new Error('Reconnect a browser wallet with a testnet Unified Account.')
+  return { address: data.address, walletAddress: recipient.address, network: 'testnet' }
 }
 
 async function fetchProfile(address: string): Promise<Profile | null> {
@@ -60,7 +66,15 @@ async function resolveProfile(address: string): Promise<{ profile: Profile | nul
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
+  const router = useRouter()
   const [state, setState] = useState<WalletState>({ ...emptyState, isLoading: true })
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const closePicker = useCallback(() => setPickerOpen(false), [])
+  const openWalletPicker = useCallback(() => {
+    setState((current) => ({ ...current, error: '' }))
+    setPickerOpen(true)
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -80,12 +94,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true }
   }, [])
 
-  const beginConnection = useCallback(async (walletAddress: string) => {
+  const beginConnection = useCallback(async (walletAddress: string, unifiedAddress?: string) => {
     setState((current) => ({ ...current, isLoading: true, error: '' }))
     try {
       const response = await fetch('/api/auth/challenge', {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ walletAddress }),
+        body: JSON.stringify({ walletAddress, unifiedAddress, network: 'testnet' }),
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.error ?? 'Could not request a wallet ownership challenge.')
@@ -97,6 +111,26 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       return null
     }
   }, [])
+
+  async function connectBrowserWallet(wallet: BrowserWallet) {
+    if (connecting) return
+    setConnecting(true)
+    setState((current) => ({ ...current, error: '' }))
+    try {
+      const accounts = await wallet.connect()
+      const account = accounts[0]
+      if (!account) throw new Error('This wallet did not expose a testnet Unified Account with native message signing. Switch your wallet to testnet and try again.')
+      const challenge = await beginConnection(account.signingAddress, account.address)
+      if (!challenge) return
+      const signature = await wallet.sign(account, challenge.message)
+      const connection = await verifyConnection(challenge.challengeToken, signature)
+      if (!connection) return
+      setPickerOpen(false)
+      router.push('/onboarding')
+    } catch (cause) {
+      setState((current) => ({ ...current, isLoading: false, error: message(cause) }))
+    } finally { setConnecting(false) }
+  }
 
   const verifyConnection = useCallback(async (challengeToken: string, signature: string) => {
     setState((current) => ({ ...current, isLoading: true, error: '' }))
@@ -161,11 +195,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     role: state.profile?.role ?? null,
     clearWallet,
     isConnected: !!state.address && !!state.walletAddress,
+    openWalletPicker,
     beginConnection,
     verifyConnection,
     refreshProfile,
     saveProfile,
-  }}>{children}</WalletContext.Provider>
+  }}>{children}{pickerOpen && <WalletPicker busy={connecting} error={state.error} onClose={closePicker} onSelect={connectBrowserWallet} />}</WalletContext.Provider>
 }
 
 export function useWallet() {

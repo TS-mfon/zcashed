@@ -7,7 +7,7 @@ import { Bell, Loader2, Menu, X, Zap } from 'lucide-react'
 import { useWallet } from './WalletContext'
 
 export function Navbar() {
-  const { isConnected, clearWallet, role, profile, error } = useWallet()
+  const { isConnected, clearWallet, role, profile, error, openWalletPicker } = useWallet()
   const pathname = usePathname()
   const [menuPath, setMenuPath] = useState<string | null>(null)
   const [disconnecting, setDisconnecting] = useState(false)
@@ -53,7 +53,7 @@ export function Navbar() {
         {links.map((link) => <Link key={link.href} href={link.href} className={`btn btn-ghost ${active(link.href) ? 'nav-active' : ''}`} aria-current={active(link.href) ? 'page' : undefined}>{link.label}</Link>)}
       </div>
       <div className="hidden lg:flex items-center gap-2 ml-auto">
-        {isConnected ? accountActions : <Link href="/onboarding" className="btn btn-primary">Connect wallet</Link>}
+        {isConnected ? accountActions : <button type="button" onClick={openWalletPicker} className="btn btn-primary">Connect wallet</button>}
       </div>
       <button ref={toggle} className="lg:hidden btn btn-ghost ml-auto" aria-label={mobileOpen ? 'Close navigation' : 'Open navigation'} aria-expanded={mobileOpen} aria-controls="mobile-navigation" onClick={() => setMenuPath(mobileOpen ? null : pathname)}>
         {mobileOpen ? <X size={22} /> : <Menu size={22} />}
@@ -61,7 +61,7 @@ export function Navbar() {
     </div>
     {mobileOpen && <div id="mobile-navigation" className="lg:hidden mobile-navigation">
       {links.map((link) => <Link key={link.href} href={link.href} aria-current={active(link.href) ? 'page' : undefined} className={`mobile-nav-link ${active(link.href) ? 'nav-active' : ''}`} onClick={() => setMenuPath(null)}>{link.label}</Link>)}
-      <div className="mobile-account-actions">{isConnected ? accountActions : <Link href="/onboarding" className="btn btn-primary" onClick={() => setMenuPath(null)}>Connect wallet</Link>}</div>
+      <div className="mobile-account-actions">{isConnected ? accountActions : <button type="button" className="btn btn-primary" onClick={() => { setMenuPath(null); openWalletPicker() }}>Connect wallet</button>}</div>
       <p className="nav-network">Existing wallet login · Custodial testnet vault</p>
     </div>}
     {(localError || error) && <p role="alert" className="nav-error">{localError || error}</p>}
