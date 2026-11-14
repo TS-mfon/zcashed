@@ -7,7 +7,7 @@ import { Bell, Loader2, Menu, X, Zap } from 'lucide-react'
 import { useWallet } from './WalletContext'
 
 export function Navbar() {
-  const { isConnected, clearWallet, role, profile, error, openWalletPicker } = useWallet()
+  const { isConnected, clearWallet, role, username, error, openWalletPicker } = useWallet()
   const pathname = usePathname()
   const [menuPath, setMenuPath] = useState<string | null>(null)
   const [disconnecting, setDisconnecting] = useState(false)
@@ -39,7 +39,7 @@ export function Navbar() {
   }
   const accountActions = <>
     <Link href="/notifications" className="btn btn-ghost" onClick={() => setMenuPath(null)} aria-label="Notifications"><Bell size={19} /><span className="lg:hidden">Notifications</span></Link>
-    <Link href="/profile" className="btn btn-outline nav-profile" onClick={() => setMenuPath(null)}><span>{profile?.displayName || 'Your profile'}</span></Link>
+    <Link href={username ? '/profile' : '/onboarding'} className="btn btn-outline nav-profile" onClick={() => setMenuPath(null)}><span>{username ? '@' + username : 'Create account / Sign in'}</span></Link>
     <button onClick={disconnect} disabled={disconnecting} className="btn btn-ghost">{disconnecting ? <Loader2 size={16} className="spin" /> : null}{disconnecting ? 'Disconnecting…' : 'Disconnect'}</button>
   </>
 

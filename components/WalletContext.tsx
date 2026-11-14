@@ -11,6 +11,7 @@ interface WalletConnection {
   address: string
   walletAddress: string
   network: ZcashNetwork
+  username: string | null
 }
 
 export interface WalletChallenge {
@@ -23,6 +24,7 @@ interface WalletState {
   address: string | null
   walletAddress: string | null
   network: ZcashNetwork | null
+  username: string | null
   profile: Profile | null
   isLoading: boolean
   error: string
@@ -38,10 +40,12 @@ interface WalletContextType extends WalletState {
   verifyConnection: (challengeToken: string, signature: string) => Promise<WalletConnection | null>
   refreshProfile: () => Promise<void>
   saveProfile: (data: Partial<Profile>) => Promise<Profile | null>
+  registerAccount: (username: string, password: string) => Promise<boolean>
+  loginAccount: (username: string, password: string) => Promise<boolean>
 }
 
 const WalletContext = createContext<WalletContextType | null>(null)
-const emptyState: WalletState = { address: null, walletAddress: null, network: null, profile: null, isLoading: false, error: '' }
+const emptyState: WalletState = { address: null, walletAddress: null, network: null, username: null, profile: null, isLoading: false, error: '' }
 const message = (cause: unknown) => cause instanceof Error ? cause.message : 'The wallet session could not be updated.'
 
 function readConnection(data: Record<string, unknown>): WalletConnection | null {
@@ -50,7 +54,8 @@ function readConnection(data: Record<string, unknown>): WalletConnection | null 
     || data.network !== 'testnet') throw new Error('This app requires a testnet wallet session.')
   const recipient = parseShieldedAddress(data.walletAddress, 'testnet')
   if (!recipient.address.startsWith('utest1')) throw new Error('Reconnect a browser wallet with a testnet Unified Account.')
-  return { address: data.address, walletAddress: recipient.address, network: 'testnet' }
+  if (data.username !== null && data.username !== undefined && (typeof data.username !== 'string' || !/^[a-z0-9_]{3,24}$/.test(data.username))) throw new Error('The server returned an invalid account username.')
+  return { address: data.address, walletAddress: recipient.address, network: 'testnet', username: typeof data.username === 'string' ? data.username : null }
 }
 
 async function fetchProfile(address: string): Promise<Profile | null> {
@@ -120,7 +125,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     try {
       const accounts = await wallet.connect()
       const account = accounts[0]
-      if (!account) throw new Error('This wallet did not expose a testnet Unified Account with native message signing. Switch your wallet to testnet and try again.')
+      if (!account) throw new Error('This wallet did not expose a testnet Unified Account. Switch your wallet to testnet and try again.')
       const response = await fetch('/api/session', {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'browser-wallet', walletAddress: account.address }),
@@ -132,7 +137,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       const profileState = await resolveProfile(connection.address)
       setState({ ...connection, ...profileState, isLoading: false })
       setPickerOpen(false)
-      router.push('/onboarding')
+      router.push(connection.username && profileState.profile ? '/dashboard' : '/onboarding')
     } catch (cause) {
       setState((current) => ({ ...current, isLoading: false, error: message(cause) }))
     } finally { setConnecting(false) }
@@ -168,6 +173,25 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setState((current) => ({ ...current, isLoading: false, error: message(cause) }))
     }
   }, [])
+
+  const authenticateAccount = useCallback(async (mode: 'register' | 'login', username: string, password: string) => {
+    setState(current => ({ ...current, isLoading: true, error: '' }))
+    try {
+      const response = await fetch('/api/account', { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, username, password }) })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error ?? 'The account could not be authenticated.')
+      const connection = readConnection(data)
+      if (!connection?.username) throw new Error('Account authentication did not return your username.')
+      const profileState = await resolveProfile(connection.address)
+      setState({ ...connection, ...profileState, isLoading: false })
+      if (mode === 'login' && profileState.profile) router.push('/dashboard')
+      return true
+    } catch (cause) {
+      setState(current => ({ ...current, isLoading: false, error: message(cause) }))
+      return false
+    }
+  }, [router])
 
   const refreshProfile = useCallback(async () => {
     if (!state.address) return
@@ -207,6 +231,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     verifyConnection,
     refreshProfile,
     saveProfile,
+    registerAccount: (username, password) => authenticateAccount('register', username, password),
+    loginAccount: (username, password) => authenticateAccount('login', username, password),
   }}>{children}{pickerOpen && <WalletPicker busy={connecting} error={state.error} onClose={closePicker} onSelect={connectBrowserWallet} />}</WalletContext.Provider>
 }
 

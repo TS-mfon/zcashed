@@ -76,12 +76,18 @@ export function normalizeJob(value: unknown): Job {
   if (!Number.isSafeInteger(funded) || Number(funded) < 0 || Number(funded) > MAX_ZATOSHIS) throw new Error('Invalid stored funded amount')
   return { id: text(row, 'id'), title: text(row, 'title'), description: text(row, 'description'),
     category: text(row, 'category', 'Other'), budgetZatoshis: amount, budgetZec: amount / 100000000,
+    ...(row.reviewPolicy === undefined ? {} : { reviewPolicy: choice(row.reviewPolicy, ['public-text-v1'] as const) }),
+    ...(row.deliverableKind === undefined ? {} : { deliverableKind: choice(row.deliverableKind, ['article', 'copy', 'translation', 'editing', 'summary'] as const) }),
     assignmentMode: choice(row.assignmentMode, ['direct', 'application'] as const, 'application'),
     clientAddress: actor(text(row, 'clientAddress')), workerAddress: actor(text(row, 'workerAddress', '')),
+    ...(row.clientUsername === undefined ? {} : { clientUsername: text(row, 'clientUsername') }),
+    ...(row.workerUsername === undefined ? {} : { workerUsername: text(row, 'workerUsername') }),
     vaultAddress: text(row, 'vaultAddress', ''), vaultReference: text(row, 'vaultReference', ''),
     vaultNetwork: choice(row.vaultNetwork, ['testnet'] as const, 'testnet'), fundedAt, fundedZatoshis: Number(funded),
     status: choice(row.status, ['funding_required', 'open', 'in_progress', 'under_review', 'needs_revision', 'approved', 'claiming', 'rejected', 'completed', 'cancelled', 'refunding', 'refunded'] as const),
     genlayerContractAddress: text(row, 'genlayerContractAddress', ''), deadline,
+    ...(row.cancellationReason === undefined ? {} : { cancellationReason: choice(row.cancellationReason, ['client_cancelled', 'deadline_expired', 'unsupported_job'] as const) }),
+    ...(row.cancelledAt === undefined ? {} : { cancelledAt: text(row, 'cancelledAt') }),
     createdAt: text(row, 'createdAt'), updatedAt: text(row, 'updatedAt'),
     applications: rows(row.applications).map(normalizeApplication), submissions: rows(row.submissions).map(normalizeSubmission) }
 }
@@ -89,7 +95,10 @@ export function normalizeProfile(value: unknown): Profile {
   const row = record(value)
   const skills = rows(row.skills)
   if (!skills.every((skill) => typeof skill === 'string')) throw new Error('Invalid stored profile skills')
+  const username = row.username
+  if (username !== undefined && (typeof username !== 'string' || !/^[a-z0-9_]{3,24}$/.test(username))) throw new Error('Invalid stored username')
   return { address: actor(text(row, 'address')), displayName: text(row, 'displayName', ''),
+    ...(username !== undefined ? { username: username as string } : {}),
     role: choice(row.role, ['client', 'freelancer', 'admin'] as const), bio: text(row, 'bio', ''),
     skills: skills.map(String), createdAt: text(row, 'createdAt') }
 }

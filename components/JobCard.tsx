@@ -2,6 +2,7 @@ import Link from 'next/link'
 import { Job } from '@/lib/types'
 import { formatZec, timeAgo, statusColor, statusLabel, categoryIcon } from '@/lib/utils'
 import { Clock, User, ChevronRight } from 'lucide-react'
+import { isJobExpired } from '@/lib/job-lifecycle'
 
 interface Props {
   job: Job
@@ -133,7 +134,7 @@ export function JobCard({ job, currentAddress }: Props) {
           style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}
         >
           <div className="flex items-center gap-4">
-            <span className={`badge ${statusColor(job.status)}`}>{statusLabel(job.status)}</span>
+            <span className={`badge ${statusColor(job.status)}`}>{['funding_required', 'open', 'in_progress', 'needs_revision'].includes(job.status) && isJobExpired(job) ? 'Deadline passed' : statusLabel(job.status)}</span>
 
             <span
               style={{
@@ -159,7 +160,7 @@ export function JobCard({ job, currentAddress }: Props) {
                 }}
               >
                 <User size={12} />
-                {job.workerAddress.slice(0, 8)}…
+                {job.workerUsername ? '@' + job.workerUsername : 'Assigned freelancer'}
               </span>
             )}
           </div>

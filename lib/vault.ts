@@ -5,7 +5,7 @@ import { getJob, updateJob } from './store'
 import type { Job } from './types'
 import { parseShieldedAddress } from './zcash'
 import { deriveVaultAddress, inspectPayout, prepareShieldedPayout, sendShieldedPayout, verifyVaultDeposit, zalletConfiguration, type VaultReceipt } from './zallet'
-import { ZingoPrebroadcastError, releaseZingoPrebroadcast } from './zingo'
+import { ZingoPrebroadcastError, releaseZingoPrebroadcast, getZingoFeeStatus, type ZingoFeeStatus } from './zingo'
 
 // Private operational records are deliberately separate from publicly listed jobs.
 // These records must never be sent to GenLayer or returned by the jobs API.
@@ -17,11 +17,14 @@ type Deposit = { _id: string; kind: 'deposit'; jobId: string; accountId: string;
   receiptId: string; receipt: VaultReceipt; confirmedAt: string }
 type Claim = { _id: string; kind: 'claim'; jobId: string; accountId: string; claimantId: string; purpose: ReleasePurpose; payoutAddress: string;
   amountZatoshis: number; memo: string; state: ClaimState; txid?: string; broadcast?: boolean; confirmations?: number;
-  retryStatus?: Job['status']; createdAt: string; updatedAt: string }
+  retryStatus?: Job['status']; fundingTxid?: string; fundingReference?: string; createdAt: string; updatedAt: string }
 
 export interface PrivateVaultOperation { purpose: ReleasePurpose; state: ClaimState; txid?: string; confirmations: number; message: string }
 export class VaultError extends Error {
   constructor(readonly status: number, message: string) { super(message) }
+}
+export class VaultPreflightError extends VaultError {
+  constructor(message: string) { super(409, message); this.name = 'VaultPreflightError' }
 }
 function receiptIdentity(receipt: VaultReceipt): string {
   if (receipt.receiptType === 'whole-shielded-account-transaction' && receipt.receiptId === receipt.txid) return receipt.txid
@@ -134,6 +137,10 @@ export async function getPrivateVaultOperation(jobId: string): Promise<PrivateVa
   const operation = await claims(await database()).findOne({ _id: 'claim:' + jobId, kind: 'claim' })
   return operation ? publicOperation(operation) : null
 }
+export async function getPrivateVaultFeeStatus(): Promise<ZingoFeeStatus> {
+  if (!process.env.ZINGO_RPC_URL) throw new VaultError(503, 'Principal-protected fee accounting requires the native testnet vault.')
+  return getZingoFeeStatus()
+}
 
 async function clearPrebroadcast(db: Db, job: Job, operation: Claim): Promise<{job: Job; operation: null}> {
   await releaseZingoPrebroadcast(operation.memo)
@@ -236,11 +243,18 @@ async function releaseJobFunds(job: Job, payoutAddress: string | undefined, purp
   }
   catch { throw new VaultError(400, 'Use a valid testnet Unified Address with an Orchard receiver copied from your existing wallet.') }
   const allocation = await releaseFunding(db, job)
-  recipient = await prepareShieldedPayout(recipient, job.budgetZatoshis)
+  const funding = await deposits(db).findOne({ _id: 'deposit:' + job.id, kind: 'deposit' })
+  if (!funding) throw new VaultError(409, 'The verified funding receipt is unavailable.')
+  try {
+    if (!process.env.ZINGO_RPC_URL) throw new VaultPreflightError('Principal-protected releases require the configured native testnet vault. The legacy wallet fallback cannot release job funds.')
+    recipient = await prepareShieldedPayout(recipient, job.budgetZatoshis)
+  }
+  catch (error) { throw new VaultPreflightError(error instanceof Error ? error.message : 'The wallet preflight failed before a payout reservation or broadcast was created.') }
   const now = new Date().toISOString()
   const intent: Claim = { _id: 'claim:' + job.id, kind: 'claim', jobId: job.id, accountId: allocation.accountId,
     claimantId: purpose === 'client_refund' ? job.clientAddress : job.workerAddress, purpose, payoutAddress: recipient, amountZatoshis: job.budgetZatoshis,
-    memo: 'zcashed:v1:payout:' + randomUUID(), state: 'reserved', retryStatus: job.status, createdAt: now, updatedAt: now }
+    memo: 'zcashed:v1:payout:' + randomUUID(), state: 'reserved', retryStatus: job.status,
+    fundingTxid: funding.receipt.txid, fundingReference: funding.reference, createdAt: now, updatedAt: now }
   try {
     const result = await claims(db).insertOne(intent)
     if (!result.acknowledged) throw new Error('Claim was not acknowledged')
@@ -264,7 +278,8 @@ async function broadcastRelease(db: Db, claiming: Job, intent: Claim): Promise<{
   await write(() => claims(db).updateOne({ _id: intent._id, state: 'reserved' }, { $set: { state: 'broadcasting', updatedAt: new Date().toISOString() } }))
   let outcome: { txid: string; broadcast: boolean } | undefined
   try {
-    outcome = await sendShieldedPayout({ address: intent.payoutAddress, amountZatoshis: intent.amountZatoshis, memo: intent.memo })
+    outcome = await sendShieldedPayout({ address: intent.payoutAddress, amountZatoshis: intent.amountZatoshis, memo: intent.memo,
+      fundingTxid: intent.fundingTxid, fundingReference: intent.fundingReference })
     const sent: Claim = { ...intent, ...outcome, state: outcome.broadcast ? 'broadcast' : 'unbroadcast', updatedAt: new Date().toISOString() }
     await saveClaim(db, sent)
     return { job: claiming, operation: publicOperation(sent) }

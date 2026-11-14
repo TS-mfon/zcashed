@@ -3,8 +3,10 @@ import { getJob, recordJobReview } from '@/lib/store'
 import { notify } from '@/lib/notify'
 import { createHash } from 'node:crypto'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
-import { acknowledgeReview, GenLayerBusyError, submitWorkOnChain, withJobOperation } from '@/lib/genlayer'
+import { acknowledgeReview, GenLayerBusyError, submitWorkOnChain, withJobOperation, hasRecoverableReview } from '@/lib/genlayer'
 import type { Submission, Job } from '@/lib/types'
+import { validateTextJob, validateTextSubmission } from '@/lib/job-policy'
+import { requireUnexpiredJob, JobLifecycleError } from '@/lib/job-lifecycle'
 
 export const maxDuration = 180
 
@@ -19,7 +21,7 @@ export async function POST(req: NextRequest) {
     const { jobId, artifact, submissionUrl, claimedAttempt } = submissionInput(body)
     return await withJobOperation(jobId, () => reviewSubmission(jobId, actor, artifact, submissionUrl, claimedAttempt))
   } catch (error) {
-    return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(503, error.message) : error)
+    return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(503, error.message) : error instanceof JobLifecycleError ? new ApiError(error.status, error.message) : error)
   }
 }
 
@@ -28,6 +30,12 @@ async function reviewSubmission(jobId: string, actor: string, artifact: string, 
     if (!job) throw new ApiError(404, 'Job not found')
     if (job.workerAddress !== actor) throw new ApiError(403, 'Only the assigned worker can submit')
     const operation = submissionAttempt(job, artifact, claimedAttempt)
+    const recovering = operation.replay || (job.genlayerContractAddress && await hasRecoverableReview(job.genlayerContractAddress, artifact, actor, operation.attempt))
+    if (!recovering) {
+      const unsupported = validateTextJob(job)
+      if (unsupported) throw new ApiError(400, unsupported)
+      requireUnexpiredJob(job)
+    }
     if (!['in_progress', 'needs_revision'].includes(job.status) && !(operation.replay && ['approved', 'rejected'].includes(job.status))) throw new ApiError(400, 'Cannot submit work in status: ' + job.status)
     if (!job.fundedAt || job.fundedZatoshis < job.budgetZatoshis) throw new ApiError(400, 'Job vault funding has not been verified')
     if (!job.genlayerContractAddress) throw new ApiError(503, 'GenLayer contract is unavailable; retry after deployment succeeds')
@@ -61,6 +69,8 @@ function submissionInput(body: Record<string, unknown>) {
     throw new ApiError(400, 'Paste the actual public deliverable text (20-12000 characters)')
   }
   const artifact = value.trim()
+  const textError = validateTextSubmission(artifact, body.submissionUrl)
+  if (textError) throw new ApiError(400, textError)
   if (artifact.replace(/https?:\/\/\S+/gi, '').trim().length < 20) throw new ApiError(400, 'A URL alone is not evidence. Paste the public deliverable text.')
   const submissionUrl = body.submissionUrl ?? ''
   if (typeof submissionUrl !== 'string' || submissionUrl.length > 2000) throw new ApiError(400, 'Invalid submission URL')

@@ -3,6 +3,17 @@ import { MAX_ZATOSHIS, parseShieldedAddress } from './zcash'
 const TXID = /^[0-9a-f]{64}$/i
 export class ZingoError extends Error { readonly status = 503 }
 export class ZingoPrebroadcastError extends ZingoError {}
+export interface ZingoFeeStatus {
+  spendableZatoshis: number
+  protectedPrincipalZatoshis: number
+  feeAvailableZatoshis: number
+  requiredFeeReserveZatoshis: number
+  feeShortfallZatoshis: number
+  activeFundedJobs: number
+  pendingPayouts: number
+  feeReservePerJobZatoshis: number
+  principalProtection: true
+}
 export function zingoConfiguration() {
   const raw = process.env.ZINGO_RPC_URL?.trim()
   const user = process.env.ZINGO_RPC_USER
@@ -34,7 +45,10 @@ async function rpc(method: string, input: unknown, sending = false): Promise<unk
     const envelope = object(await response.json())
     if (sending && envelope.id === id && envelope.error && typeof envelope.error === 'object') {
       const data = (envelope.error as {data?: {stage?: unknown; retryable?: unknown}}).data
-      if (data?.stage === 'prebroadcast' && data.retryable === true) throw new ZingoPrebroadcastError('The wallet confirmed that no transfer was broadcast. You can authorize another attempt.')
+      if (data?.stage === 'prebroadcast' && data.retryable === true) {
+        const reason = (envelope.error as {message?: unknown}).message
+        throw new ZingoPrebroadcastError(typeof reason === 'string' && reason.length <= 500 ? reason : 'The wallet confirmed that no transfer was broadcast. You can authorize another attempt.')
+      }
     }
     if (!response.ok || envelope.id !== id || envelope.error || !Object.hasOwn(envelope, 'result')) throw new ZingoError('The native testnet wallet cannot complete this operation.')
     return envelope.result
@@ -67,11 +81,23 @@ export async function verifyZingoDeposit(input: {address: string; reference: str
 export async function prepareZingoPayout(address: string, amountZatoshis: number) {
   budget(amountZatoshis); const recipient = orchard(address)
   const result = object(await rpc('vault_prepare_payout', {address: recipient, amountZatoshis}))
-  if (result.address !== recipient || !positive(result.spendableZatoshis) || result.spendableZatoshis <= amountZatoshis) throw new ZingoError('Fund the native shielded wallet for the payout plus transaction fees.')
+  if (result.principalProtection !== true) throw new ZingoError('The vault operator must finish the principal-protection upgrade before releasing funds.')
+  if (result.address !== recipient || !positive(result.spendableZatoshis) || result.spendableZatoshis <= amountZatoshis ||
+      result.feeShortfallZatoshis !== 0 || result.pendingPayouts !== 0) throw new ZingoError('The operator must top up its fee balance or reconcile a pending payout. Job deposits stay protected.')
   return recipient
 }
-export async function sendZingoPayout(input: {address: string; amountZatoshis: number; memo: string}) {
+export async function getZingoFeeStatus(): Promise<ZingoFeeStatus> {
+  const result = object(await rpc('vault_fee_status', {}))
+  const fields = ['spendableZatoshis', 'protectedPrincipalZatoshis', 'feeAvailableZatoshis', 'requiredFeeReserveZatoshis',
+    'feeShortfallZatoshis', 'activeFundedJobs', 'pendingPayouts', 'feeReservePerJobZatoshis'] as const
+  if (result.principalProtection !== true || fields.some(field => typeof result[field] !== 'number' ||
+      !Number.isSafeInteger(result[field]) || (result[field] as number) < 0)) throw new ZingoError('The native vault did not return its protected principal and fee reserves.')
+  return result as unknown as ZingoFeeStatus
+}
+export async function sendZingoPayout(input: {address: string; amountZatoshis: number; memo: string; fundingTxid?: string; fundingReference?: string}) {
   budget(input.amountZatoshis); orchard(input.address)
+  if (typeof input.fundingTxid !== 'string' || !TXID.test(input.fundingTxid) ||
+      typeof input.fundingReference !== 'string' || !/^zcashed:v1:deposit:[0-9a-f-]{36}$/.test(input.fundingReference)) throw new ZingoError('The payout requires its original verified funding receipt.')
   const memo = Buffer.from(input.memo, 'utf8')
   if (!memo.length || memo.length > 512) throw new ZingoError('Invalid payout memo.')
   const result = object(await rpc('vault_send_payout', input, true))

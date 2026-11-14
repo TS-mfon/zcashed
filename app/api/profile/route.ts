@@ -1,21 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getProfile, upsertProfile } from '@/lib/store'
 import { notify } from '@/lib/notify'
-import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
+import { ApiError, apiErrorResponse, getSession, requireActor } from '@/lib/auth'
 import type { Profile } from '@/lib/types'
 
 export async function GET(req: NextRequest) {
   try {
-    const actor = requireActor(req)
-    return NextResponse.json({ profile: await getProfile(actor) }, { headers: { 'Cache-Control': 'private, no-store' } })
+    const actor = requireActor(req, undefined, true)
+    const profile = await getProfile(actor)
+    const username = getSession(req)?.username
+    return NextResponse.json({ profile: profile ? { ...profile, ...(username ? { username } : {}) } : null }, { headers: { 'Cache-Control': 'private, no-store' } })
   } catch (error) { return apiErrorResponse(error) }
 }
 
 export async function POST(req: NextRequest) {
   try {
     const actor = requireActor(req)
+    const username = getSession(req)!.username!
     const body: unknown = await req.json()
-    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !['displayName', 'role', 'bio', 'skills'].includes(key))) throw new ApiError(400, 'Supply only profile fields; your connected wallet identifies the account.')
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !['displayName', 'role', 'bio', 'skills'].includes(key))) throw new ApiError(400, 'Supply only profile fields; your signed-in username identifies the account.')
     const fields = body as Record<string, unknown>
     if (fields.role !== undefined && fields.role !== 'client' && fields.role !== 'freelancer') throw new ApiError(400, 'Choose client or freelancer.')
     for (const [key, maximum] of [['displayName', 80], ['bio', 2000]] as const) {
@@ -25,7 +28,8 @@ export async function POST(req: NextRequest) {
     const existing = await getProfile(actor)
     const profile: Profile = {
       address: actor,
-      displayName: fields.displayName as string ?? existing?.displayName ?? '',
+      username,
+      displayName: fields.displayName as string ?? existing?.displayName ?? username,
       role: fields.role as 'client' | 'freelancer' ?? existing?.role ?? 'freelancer',
       bio: fields.bio as string ?? existing?.bio ?? '',
       skills: fields.skills as string[] ?? existing?.skills ?? [],

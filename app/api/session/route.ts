@@ -4,7 +4,7 @@ import { apiErrorResponse, assertSameOrigin, connectWallet, connectBrowserWallet
 export async function GET(req: NextRequest) {
   try {
     const session = getSession(req)
-    return NextResponse.json(session ? { address: session.id, walletAddress: session.walletAddress, network: session.network } : { address: null, walletAddress: null, network: null })
+    return NextResponse.json(session ? { address: session.id, walletAddress: session.walletAddress, network: session.network, username: session.username ?? null } : { address: null, walletAddress: null, network: null, username: null })
   } catch (error) { return apiErrorResponse(error) }
 }
 

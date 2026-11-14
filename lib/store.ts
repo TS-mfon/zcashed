@@ -36,13 +36,24 @@ async function mutableJob(db: Db, id: string): Promise<Job> {
 
 export async function getAllJobs(): Promise<Job[]> {
   const db = await database()
-  if (!db) return fileJobs.all()
+  if (!db) return withJobUsernames(db, fileJobs.all())
   const rows = await mongoOperation('list jobs', () => db.collection<JobDocument>('jobs').find({}).sort({ createdAt: -1 }).toArray())
-  return rows.map(normalizeJob)
+  return withJobUsernames(db, rows.map(normalizeJob))
 }
 export async function getJob(id: string): Promise<Job | null> {
   const db = await database()
-  return db ? mongoJob(db, id) : fileJobs.get(id)
+  const job = db ? await mongoJob(db, id) : fileJobs.get(id)
+  return job ? (await withJobUsernames(db, [job]))[0] : null
+}
+async function withJobUsernames(db: Db | null, jobs: Job[]): Promise<Job[]> {
+  if (!jobs.length) return jobs
+  const ids = [...new Set(jobs.flatMap(job => [job.clientAddress, job.workerAddress]).filter(Boolean))]
+  const profiles = db ? await mongoOperation('read job usernames', () => db.collection<ProfileDocument>('profiles').find({ _id: { $in: ids } }, { projection: { _id: 1, username: 1 } }).toArray()) : fileProfiles.all()
+  const usernames = new Map(profiles.filter(profile => profile.username).map(profile => [('_id' in profile ? profile._id : profile.address) as string, profile.username]))
+  return jobs.map(job => ({ ...job,
+    ...(usernames.get(job.clientAddress) ? { clientUsername: usernames.get(job.clientAddress) } : {}),
+    ...(usernames.get(job.workerAddress) ? { workerUsername: usernames.get(job.workerAddress) } : {}),
+  }))
 }
 export async function createJob(value: Job): Promise<Job> {
   const job = normalizeJob(value)
@@ -70,15 +81,15 @@ export async function updateJob(id: string, updates: Partial<Job>, expected?: Jo
 }
 export async function getJobsByClient(address: string): Promise<Job[]> {
   const db = await database()
-  if (!db) return fileJobs.all().filter((job) => job.clientAddress === address)
+  if (!db) return withJobUsernames(db, fileJobs.all().filter((job) => job.clientAddress === address))
   const rows = await mongoOperation('list client jobs', () => db.collection<JobDocument>('jobs').find({ clientAddress: address }).sort({ createdAt: -1 }).toArray())
-  return rows.map(normalizeJob)
+  return withJobUsernames(db, rows.map(normalizeJob))
 }
 export async function getJobsByWorker(address: string): Promise<Job[]> {
   const db = await database()
-  if (!db) return fileJobs.all().filter((job) => job.workerAddress === address)
+  if (!db) return withJobUsernames(db, fileJobs.all().filter((job) => job.workerAddress === address))
   const rows = await mongoOperation('list worker jobs', () => db.collection<JobDocument>('jobs').find({ workerAddress: address }).sort({ createdAt: -1 }).toArray())
-  return rows.map(normalizeJob)
+  return withJobUsernames(db, rows.map(normalizeJob))
 }
 
 export async function addApplication(value: Application): Promise<void> {
@@ -192,6 +203,7 @@ export async function upsertProfile(value: Profile): Promise<Profile> {
   requireUserId(profile.address)
   const db = await database()
   if (!db) return fileProfiles.upsert(profile)
+  await db.collection<ProfileDocument>('profiles').createIndex({ username: 1 }, { unique: true, partialFilterExpression: { username: { $exists: true } } })
   const result = await mongoOperation('upsert profile', () => db.collection<ProfileDocument>('profiles').replaceOne(
     { _id: profile.address }, profile, { upsert: true }))
   acknowledged(result)

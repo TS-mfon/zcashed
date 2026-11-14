@@ -9,6 +9,7 @@ const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const { MongoClient } = require('mongodb');
 const actionsOwner = process.env.ZCASHED_ACTIONS_OWNER;
 const actionsGenerationValue = process.env.ZCASHED_ACTIONS_GENERATION;
 const actionsEnabled = actionsOwner !== undefined || actionsGenerationValue !== undefined;
@@ -39,8 +40,11 @@ let balance = null;
 let loopBusy = false;
 let shuttingDown = false;
 let writeQueue = Promise.resolve();
+let principalStore;
+const feeReservePerJob = Number(process.env.ZCASHED_FEE_RESERVE_PER_JOB || '10000');
+if (!Number.isSafeInteger(feeReservePerJob) || feeReservePerJob < 10000 || feeReservePerJob > 100000000) throw new Error('The per-job fee reserve must be an integer from 10000 to 100000000 zatoshis.');
 const ledgerPath = base + '/vault-bridge-ledger.private.json';
-let ledger = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath, 'utf8')) : { allocations: {}, sends: {} };
+let ledger = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath, 'utf8')) : { allocations: {}, sends: {}, principalReceipts: {} };
 class BridgeError extends Error {}
 class PrebroadcastError extends BridgeError {
   constructor(message) { super(message); this.data = { stage: 'prebroadcast', retryable: true }; }
@@ -66,7 +70,7 @@ async function assertSpendLease() {
 function loadedLedger(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !value.allocations || !value.sends ||
       typeof value.allocations !== 'object' || Array.isArray(value.allocations) || typeof value.sends !== 'object' || Array.isArray(value.sends)) throw new Error('The hosted operator requires its durable shared allocation and payout ledger.');
-  return value;
+  return { ...value, principalReceipts: value.principalReceipts ?? {} };
 }
 const parsed = value => { try { return JSON.parse(value); } catch { return value; } };
 const serializeWrite = fn => { const task = writeQueue.then(fn); writeQueue = task.catch(() => {}); return task; };
@@ -95,7 +99,7 @@ function publicStatus() {
   return { runtime: publicWallet.runtime, network: 'testnet', account: 0, fundingAddress: publicWallet.fundingAddress,
     running, lightwalletd: server, walletHeight, chainHeight, syncProgress, balance, lastCycle, lastError,
     capabilities: { nativeApi: true, zalletCompatible: false, exactNoteOutputReceipts: false,
-      fundingReceipt: 'whole-shielded-account-transaction', vaultApiVersion: 1, spending: true }, };
+      fundingReceipt: 'whole-shielded-account-transaction', vaultApiVersion: 2, principalProtection: true, spending: true }, };
 }
 function saveStatus() { fs.writeFileSync(base + '/bridge-status.json', JSON.stringify(publicStatus(), null, 2), { mode: 0o600 }); }
 async function cycle() {
@@ -167,11 +171,10 @@ async function prepare(input) {
   assertAmount(input.amountZatoshis);
   await syncedHeight();
   const shieldedAddress = await orchardRecipient(input.address);
-  const current = parsed(await native.get_balance());
-  if (balanceValue(current.total_transparent_balance) !== 0 || balanceValue(current.total_sapling_balance) !== 0) throw new BridgeError('This demo operator wallet requires only Orchard or Ironwood funds before payout.');
-  const spendable = balanceValue(current.confirmed_ironwood_balance) + balanceValue(current.confirmed_orchard_balance);
-  if (!Number.isSafeInteger(spendable) || spendable <= input.amountZatoshis) throw new BridgeError('Fund the operator shielded testnet wallet for the payout plus wallet-calculated fees.');
-  return { address: input.address, shieldedAddress, spendableZatoshis: spendable };
+  const fees = await feeSummary();
+  if (fees.pendingPayouts) throw new BridgeError('An earlier payout is awaiting wallet confirmation or reconciliation. Other job deposits stay protected.');
+  if (fees.feeShortfallZatoshis > 0 || fees.spendableZatoshis <= input.amountZatoshis) throw new BridgeError('The operator must top up its separate fee balance. Job deposits cannot pay transaction fees.');
+  return { address: input.address, shieldedAddress, ...fees, principalProtection: true };
 }
 const shieldedPools = pools => Array.isArray(pools) && pools.length > 0 && pools.every(pool => pool === 'orchard' || pool === 'ironwood');
 function normalizePools(pools) {
@@ -185,6 +188,100 @@ async function valueTransfers() {
     pools_sent_from: normalizePools(transfer.pools_sent_from), pools_received: normalizePools(transfer.pools_received) }));
 }
 function memoMatches(transfer, memo) { return Array.isArray(transfer.memos) && transfer.memos.length === 1 && transfer.memos[0] === memo; }
+function confirmedSend(transfer, reservation, height) {
+  return transfer.kind === 'sent' && transfer.status === 'confirmed' && Number.isSafeInteger(transfer.blockheight) &&
+    transfer.blockheight > 0 && transfer.blockheight <= height && /^[0-9a-f]{64}$/.test(transfer.txid) &&
+    transfer.recipient_address === reservation.shieldedAddress && transfer.value === reservation.amountZatoshis &&
+    (!reservation.txid || transfer.txid === reservation.txid) && memoMatches(transfer, reservation.memo) &&
+    shieldedPools(transfer.pools_received) && shieldedPools(transfer.pools_sent_from);
+}
+async function legacyPrincipal(reservation) {
+  if (reservation.principalReceiptId) return reservation;
+  if (!process.env.MONGODB_URI) throw new BridgeError('An older payout requires operator reconciliation before principal reserves can be upgraded.');
+  if (!principalStore) {
+    const client = new MongoClient(process.env.MONGODB_URI, { readConcern: { level: 'majority' }, readPreference: 'primary',
+      serverSelectionTimeoutMS: 10000, connectTimeoutMS: 10000, socketTimeoutMS: 20000 });
+    principalStore = client.connect().then(() => ({ client, operations: client.db('zcashed').collection('vault_operations') }));
+  }
+  const { operations } = await principalStore;
+  const claim = await operations.findOne({ kind: 'claim', memo: reservation.memo });
+  const deposit = claim && await operations.findOne({ _id: 'deposit:' + claim.jobId, kind: 'deposit' });
+  if (!deposit || deposit.accountId !== '0' || deposit.receipt?.amountZatoshis !== reservation.amountZatoshis ||
+      !/^[0-9a-f]{64}$/.test(deposit.receiptId)) throw new BridgeError('An older payout needs its original verified principal receipt before the vault can send again.');
+  return { ...reservation, principalReceiptId: deposit.receiptId, fundingReference: deposit.reference };
+}
+async function synchronizePrincipal() {
+  const transfers = await valueTransfers();
+  const height = Number(parsed(await native.get_latest_block_wallet())?.height);
+  let receipts = { ...(ledger.principalReceipts || {}) };
+  // Discover deposits from native evidence even before an application verifies
+  // funding. A job-memo deposit can never become the operator's fee balance.
+  const incoming = transfers.filter(transfer => transfer.kind === 'received' && transfer.status === 'confirmed' &&
+    /^[0-9a-f]{64}$/.test(transfer.txid) && Number.isSafeInteger(transfer.value) && transfer.value > 0 &&
+    Array.isArray(transfer.memos) && shieldedPools(transfer.pools_received) &&
+    Array.isArray(transfer.pools_sent_from) && transfer.pools_sent_from.length === 0);
+  const jobTransactionIds = new Set(incoming.filter(transfer => transfer.memos.some(memo =>
+    typeof memo === 'string' && memo.startsWith('zcashed:v1:deposit:'))).map(transfer => transfer.txid));
+  for (const txid of jobTransactionIds) {
+    const parts = incoming.filter(transfer => transfer.txid === txid);
+    const references = parts.flatMap(transfer => transfer.memos);
+    const reference = references.length === 1 && /^zcashed:v1:deposit:[0-9a-f-]{36}$/.test(references[0]) ? references[0] : '';
+    const amountZatoshis = parts.reduce((sum, transfer) => sum + transfer.value, 0);
+    if (!Number.isSafeInteger(amountZatoshis)) throw new BridgeError('Unsupported protected principal amount.');
+    const observed = { txid, reference, amountZatoshis };
+    if (receipts[txid] && JSON.stringify(receipts[txid]) !== JSON.stringify(observed)) throw new BridgeError('A protected principal receipt changed; operator reconciliation is required.');
+    receipts = { ...receipts, [txid]: observed };
+  }
+  let sends = {};
+  for (const [key, existing] of Object.entries(ledger.sends)) {
+    const reservation = await legacyPrincipal(existing);
+    const matches = transfers.filter(transfer => confirmedSend(transfer, reservation, height));
+    const reconciled = matches.length === 1 ? { ...reservation, state: 'confirmed', txid: matches[0].txid } :
+      reservation.state === 'confirmed' ? { ...reservation, state: 'unknown' } : reservation;
+    sends = { ...sends, [key]: reconciled };
+  }
+  const next = { ...ledger, principalReceipts: receipts, sends };
+  if (JSON.stringify(next) !== JSON.stringify(ledger)) await persistLedger(next);
+  return transfers;
+}
+async function feeSummary(ignoreSendKey) {
+  const transfers = await synchronizePrincipal();
+  const current = parsed(await native.get_balance());
+  if (balanceValue(current.total_transparent_balance) !== 0 || balanceValue(current.total_sapling_balance) !== 0) throw new BridgeError('This demo operator wallet requires only Orchard or Ironwood funds before payout.');
+  const spendableZatoshis = balanceValue(current.confirmed_ironwood_balance) + balanceValue(current.confirmed_orchard_balance);
+  const completed = new Set(Object.values(ledger.sends).filter(send => send.state === 'confirmed').map(send => send.principalReceiptId));
+  const protectedReceipts = Object.values(ledger.principalReceipts || {}).filter(receipt => !completed.has(receipt.txid));
+  const protectedPrincipalZatoshis = protectedReceipts.reduce((sum, receipt) => sum + balanceValue(receipt.amountZatoshis), 0);
+  const requiredFeeReserveZatoshis = protectedReceipts.length * feeReservePerJob;
+  // A background scan may discover a new deposit between reads. Independently
+  // bound fees by confirmed operator credits, so that race cannot spend a job's
+  // principal. Unknown outgoing transfers require accounting reconciliation.
+  const operatorCredits = transfers.filter(transfer => transfer.kind === 'received' && transfer.status === 'confirmed' &&
+    shieldedPools(transfer.pools_received) && Array.isArray(transfer.pools_sent_from) && transfer.pools_sent_from.length === 0 &&
+    Array.isArray(transfer.memos) && !Object.hasOwn(ledger.principalReceipts || {}, transfer.txid))
+    .reduce((sum, transfer) => sum + balanceValue(transfer.value), 0);
+  const confirmed = Object.values(ledger.sends).filter(send => send.state === 'confirmed');
+  if (transfers.some(transfer => transfer.kind === 'sent' && !Object.values(ledger.sends).some(send =>
+      memoMatches(transfer, send.memo) && transfer.value === send.amountZatoshis && transfer.recipient_address === send.shieldedAddress))) {
+    throw new BridgeError('The wallet contains an unaccounted outgoing transfer. The operator must reconcile its fee balance before releasing another job.');
+  }
+  const feesSpent = confirmed.reduce((sum, send) => sum + balanceValue(send.feeZatoshis), 0);
+  const operatorFeeBalanceZatoshis = Math.max(0, operatorCredits - feesSpent);
+  const feeAvailableZatoshis = Math.max(0, Math.min(spendableZatoshis - protectedPrincipalZatoshis, operatorFeeBalanceZatoshis));
+  if (![spendableZatoshis, protectedPrincipalZatoshis, requiredFeeReserveZatoshis, operatorCredits, feesSpent].every(Number.isSafeInteger)) throw new BridgeError('Unsupported aggregate vault balance.');
+  return { spendableZatoshis, protectedPrincipalZatoshis, feeAvailableZatoshis, requiredFeeReserveZatoshis,
+    feeShortfallZatoshis: Math.max(0, protectedPrincipalZatoshis - spendableZatoshis, requiredFeeReserveZatoshis - feeAvailableZatoshis),
+    activeFundedJobs: protectedReceipts.length,
+    pendingPayouts: Object.entries(ledger.sends).filter(([key, send]) => key !== ignoreSendKey && send.state !== 'confirmed').length,
+    principalProtection: true, feeReservePerJobZatoshis: feeReservePerJob };
+}
+function principalForSend(input) {
+  if (typeof input.fundingTxid !== 'string' || !/^[0-9a-f]{64}$/.test(input.fundingTxid) || typeof input.fundingReference !== 'string') throw new PrebroadcastError('A payout requires the original verified job funding receipt.');
+  const receipt = ledger.principalReceipts?.[input.fundingTxid];
+  if (!receipt || receipt.reference !== input.fundingReference || receipt.amountZatoshis !== input.amountZatoshis) throw new PrebroadcastError('The payout does not match a protected job deposit.');
+  if (Object.values(ledger.sends).some(send => send.principalReceiptId === input.fundingTxid)) throw new PrebroadcastError('This job deposit already has a payout or refund reservation.');
+  return receipt;
+}
 function sendKey(memo) {
   if (typeof memo !== 'string' || !/^zcashed:v1:payout:[0-9a-f-]{36}$/.test(memo)) throw new PrebroadcastError('Invalid opaque payout memo.');
   return crypto.createHash('sha256').update(memo).digest('hex');
@@ -218,13 +315,14 @@ const vaultMethods = {
     await persistLedger({ ...ledger, allocations: { ...ledger.allocations, [key]: allocation } });
     return allocation;
   }),
-  vault_verify_deposit: async params => {
+  vault_verify_deposit: params => serializeWrite(async () => {
     const input = inputObject(params);
     assertAmount(input.amountZatoshis);
     const height = await syncedHeight();
     await orchardRecipient(input.address);
     if (typeof input.reference !== 'string' || !/^zcashed:v1:deposit:[0-9a-f-]{36}$/.test(input.reference) || !Number.isSafeInteger(input.startHeight) || input.startHeight < 1 || input.startHeight > height) throw new BridgeError('Invalid vault receipt reference or start height.');
     if (!Object.values(ledger.allocations).some(allocation => allocation.address === input.address && allocation.startHeight === input.startHeight)) throw new BridgeError('The funding address is not a persisted vault allocation.');
+    await synchronizePrincipal();
     const transfers = await valueTransfers();
     for (const transfer of transfers) {
       if (transfer.kind !== 'received' || transfer.status !== 'confirmed' || !Number.isSafeInteger(transfer.blockheight) || transfer.blockheight < input.startHeight || transfer.blockheight > height ||
@@ -236,8 +334,9 @@ const vaultMethods = {
         accountId: '0', memo: input.reference, poolsReceived: transfer.pools_received };
     }
     return null;
-  },
-  vault_prepare_payout: params => prepare(inputObject(params)),
+  }),
+  vault_fee_status: () => serializeWrite(async () => { await assertSpendLease(); await syncedHeight(); return feeSummary(); }),
+  vault_prepare_payout: params => serializeWrite(() => prepare(inputObject(params))),
   vault_send_payout: params => serializeWrite(async () => {
     const input = inputObject(params);
     const key = sendKey(input.memo);
@@ -245,7 +344,9 @@ const vaultMethods = {
     let prepared;
     try { prepared = await prepare(input); }
     catch (error) { throw new PrebroadcastError(error instanceof BridgeError ? error.message : 'The wallet preflight failed before any payout proposal or broadcast was dispatched.'); }
-    const reservation = { address: prepared.address, shieldedAddress: prepared.shieldedAddress, amountZatoshis: input.amountZatoshis, memo: input.memo, state: 'reserved', createdAt: new Date().toISOString() };
+    const principal = principalForSend(input);
+    const reservation = { address: prepared.address, shieldedAddress: prepared.shieldedAddress, amountZatoshis: input.amountZatoshis, memo: input.memo,
+      principalReceiptId: principal.txid, fundingReference: principal.reference, state: 'reserved', createdAt: new Date().toISOString() };
     try { await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: reservation } }); }
     catch { return cancelBeforeBroadcast(key, 'The payout could not be reserved before wallet dispatch.', false, false); }
     let proposalDispatched = false;
@@ -258,6 +359,12 @@ const vaultMethods = {
       const proposal = parsed(await native.send(JSON.stringify([{ address: prepared.shieldedAddress, amount: input.amountZatoshis, memo: input.memo }])));
       if (proposal?.error || !Number.isSafeInteger(proposal?.fee) || proposal.fee < 0 || prepared.spendableZatoshis < input.amountZatoshis + proposal.fee) {
         return await cancelBeforeBroadcast(key, 'The wallet rejected the payout proposal before broadcast; no payout was sent.', proposalDispatched, confirmDispatched);
+      }
+      const freshFees = await feeSummary(key);
+      const remainingReserve = Math.max(0, freshFees.activeFundedJobs - 1) * feeReservePerJob;
+      if (freshFees.pendingPayouts || freshFees.feeAvailableZatoshis < proposal.fee + remainingReserve ||
+          freshFees.spendableZatoshis < input.amountZatoshis + proposal.fee) {
+        return await cancelBeforeBroadcast(key, 'The operator fee balance is too low. Other job deposits and their fee reserves remain protected; no payout was sent.', proposalDispatched, confirmDispatched);
       }
       try { await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, state: 'broadcasting', feeZatoshis: proposal.fee } } }); }
       catch { return await cancelBeforeBroadcast(key, 'The payout reservation could not be made durable before broadcast; no payout was sent.', proposalDispatched, confirmDispatched); }
@@ -364,6 +471,7 @@ async function shutdown() {
     if (actionsState) { exitCode = 1; lastError = 'The hosted wallet shutdown checkpoint could not be saved durably.'; }
   }
   if (actionsState) await actionsState.close().catch(() => {});
+  if (principalStore) await (await principalStore).client.close().catch(() => {});
   running = false; saveStatus(); process.exit(exitCode);
 }
 process.on('SIGTERM', shutdown);

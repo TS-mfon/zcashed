@@ -179,7 +179,7 @@ export async function prepareShieldedPayout(address: string, amountZatoshis: num
   return recipient
 }
 
-export async function sendShieldedPayout(input: { address: string; amountZatoshis: number; memo: string }): Promise<{ txid: string; broadcast: boolean }> {
+export async function sendShieldedPayout(input: { address: string; amountZatoshis: number; memo: string; fundingTxid?: string; fundingReference?: string }): Promise<{ txid: string; broadcast: boolean }> {
   if (process.env.ZINGO_RPC_URL) return sendZingoPayout(input)
   const address = await prepareShieldedPayout(input.address, input.amountZatoshis)
   const memo = Buffer.from(input.memo, 'utf8')

@@ -13,7 +13,7 @@ import Link from 'next/link'
 type DashboardTab = 'posted' | 'working' | 'applications'
 
 export default function DashboardPage() {
-  const { address, isConnected, isLoading, role, profile } = useWallet()
+  const { address, username, isConnected, isLoading, role, profile } = useWallet()
   const router = useRouter()
 
   const [posted, setPosted] = useState<Job[]>([])
@@ -25,8 +25,8 @@ export default function DashboardPage() {
   const tab = tabSelection?.role === role ? tabSelection.tab : role === 'client' ? 'posted' : 'working'
 
   useEffect(() => {
-    if (!isLoading && !isConnected) router.push('/onboarding')
-  }, [isLoading, isConnected, router])
+    if (!isLoading && (!isConnected || !username)) router.push('/onboarding')
+  }, [isLoading, isConnected, username, router])
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -44,7 +44,7 @@ export default function DashboardPage() {
   }, [])
 
   useEffect(() => {
-    if (!address) return
+    if (!address || !username) return
     const controller = new AbortController()
     fetchDashboardData(controller.signal)
       .then(({ jobs, apps }) => {
@@ -61,9 +61,9 @@ export default function DashboardPage() {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [address])
+  }, [address, username])
 
-  if (isLoading || !isConnected) {
+  if (isLoading || !isConnected || !username) {
     return <div className="py-20 text-center"><Loader2 size={30} className="spin" style={{ color: 'var(--primary)', margin: '0 auto' }} /></div>
   }
 

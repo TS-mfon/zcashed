@@ -4,7 +4,8 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { JobCard } from '@/components/JobCard'
 import { useWallet } from '@/components/WalletContext'
-import { Job, JOB_CATEGORIES } from '@/lib/types'
+import { Job } from '@/lib/types'
+import { SUPPORTED_JOB_CATEGORIES, validateTextJob } from '@/lib/job-policy'
 import { Plus, Search, SlidersHorizontal, Briefcase } from 'lucide-react'
 
 export default function JobsPage() {
@@ -26,6 +27,7 @@ export default function JobsPage() {
   }, [])
 
   const filtered = jobs.filter((job) => {
+    if (validateTextJob(job)) return false
     const matchSearch =
       !search ||
       job.title.toLowerCase().includes(search.toLowerCase()) ||
@@ -75,7 +77,7 @@ export default function JobsPage() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <SlidersHorizontal size={15} style={{ color: 'var(--muted)' }} />
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            {(['All', ...JOB_CATEGORIES] as string[]).map((cat) => (
+            {(['All', ...SUPPORTED_JOB_CATEGORIES] as string[]).map((cat) => (
               <button
                 key={cat}
                 onClick={() => setCategory(cat)}

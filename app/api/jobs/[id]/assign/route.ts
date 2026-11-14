@@ -3,6 +3,8 @@ import { getJob, assignJob } from '@/lib/store'
 import { notify } from '@/lib/notify'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
 import { acceptJobOnChain, acknowledgeAssignment, GenLayerBusyError, withJobOperation } from '@/lib/genlayer'
+import { validateTextJob } from '@/lib/job-policy'
+import { requireUnexpiredJob, JobLifecycleError } from '@/lib/job-lifecycle'
 
 export const maxDuration = 180
 
@@ -16,7 +18,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const { id } = await params
     return await withJobOperation(id, () => assignApplicant(id, actor, body.applicationId))
   } catch (error) {
-    return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(503, error.message) : error)
+    return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(503, error.message) : error instanceof JobLifecycleError ? new ApiError(error.status, error.message) : error)
   }
 }
 
@@ -27,6 +29,9 @@ async function assignApplicant(id: string, actor: string, applicationId: string)
   if (job.assignmentMode !== 'application') throw new ApiError(400, 'This job uses direct acceptance')
   const chosen = (job.applications ?? []).find((application) => application.id === applicationId)
   if (job.status === 'in_progress' && chosen?.status === 'accepted' && job.workerAddress === chosen.applicantAddress) { await acknowledgeAssignment(job.genlayerContractAddress, chosen.applicantAddress); return NextResponse.json({ job }) }
+  const unsupported = validateTextJob(job)
+  if (unsupported) throw new ApiError(400, unsupported)
+  requireUnexpiredJob(job)
   if (job.status !== 'open' || job.workerAddress) throw new ApiError(400, 'Job is not open')
   if (!chosen || chosen.status !== 'pending') throw new ApiError(404, 'Pending application not found')
   if (chosen.applicantAddress === actor) throw new ApiError(400, 'Cannot assign your own job to yourself')

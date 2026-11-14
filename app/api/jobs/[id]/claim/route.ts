@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
 import { getJob } from '@/lib/store'
-import { claimJobPayment, getPrivateVaultOperation, VaultError } from '@/lib/vault'
+import { claimJobPayment, getPrivateVaultOperation, VaultError, VaultPreflightError } from '@/lib/vault'
 import { ZalletError } from '@/lib/zallet'
 
 export const runtime = 'nodejs'
@@ -41,5 +41,6 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
 }
 
 function failure(error: unknown) {
+  if (error instanceof VaultPreflightError) return NextResponse.json({ error: error.message, stage: 'prebroadcast', retryable: true }, { status: error.status, headers: privateHeaders })
   return apiErrorResponse(error instanceof VaultError || error instanceof ZalletError ? new ApiError(error.status, error.message) : error)
 }

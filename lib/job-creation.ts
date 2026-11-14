@@ -3,11 +3,11 @@ import type { Collection } from 'mongodb'
 import { ApiError } from './auth'
 import { deployEscrowContract, withJobOperation } from './genlayer'
 import { getMongoDatabase } from './mongodb'
-import { createJob, getJob } from './store'
+import { createJob, getJob, getProfile } from './store'
 import { createJobVault } from './vault'
 import type { Job } from './types'
 
-export type JobOffer = Pick<Job, 'title' | 'description' | 'budgetZatoshis' | 'budgetZec' | 'category' | 'assignmentMode' | 'deadline'>
+export type JobOffer = Pick<Job, 'title' | 'description' | 'budgetZatoshis' | 'budgetZec' | 'category' | 'assignmentMode' | 'deadline' | 'deliverableKind' | 'reviewPolicy'>
 type Vault = Awaited<ReturnType<typeof createJobVault>>
 type CreationIntent = {
   _id: string; actor: string; payloadHash: string; offer: JobOffer; jobId: string; createdAt: string
@@ -83,7 +83,9 @@ export async function createJobFromIntent(actor: string, key: string, offer: Job
       }
       await persist(collection, id, { contractAddress: genlayerContractAddress })
     }
-    const job: Job = { ...intent.offer, id: intent.jobId, clientAddress: actor, workerAddress: '', status: 'funding_required',
+    const profile = await getProfile(actor)
+    const job: Job = { ...intent.offer, id: intent.jobId, clientAddress: actor, clientUsername: profile?.username,
+      workerAddress: '', status: 'funding_required',
       vaultAddress: vault.address, vaultReference: vault.reference, vaultNetwork: vault.network, fundedAt: null, fundedZatoshis: 0,
       genlayerContractAddress, createdAt: intent.createdAt, updatedAt: intent.createdAt, submissions: [], applications: [] }
     // The complete provider linkage is already durable before inserting the public job.

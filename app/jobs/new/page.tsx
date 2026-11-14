@@ -3,19 +3,21 @@
 import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useWallet } from '@/components/WalletContext'
-import { JOB_CATEGORIES, Job } from '@/lib/types'
+import type { Job } from '@/lib/types'
 import { parseZecToZatoshis } from '@/lib/zcash'
+import { SUPPORTED_JOB_CATEGORIES, TEXT_DELIVERABLE_KINDS, TEXT_DELIVERABLE_LABELS, TEXT_JOB_SCOPE, validateTextJob, type TextDeliverableKind } from '@/lib/job-policy'
 import { Info, AlertCircle, Loader2 } from 'lucide-react'
 
 export default function NewJobPage() {
   const router = useRouter()
-  const { address, isConnected, role, isLoading } = useWallet()
+  const { address, username, isConnected, role, isLoading } = useWallet()
 
   const creationId = useRef<string | null>(null)
   const [form, setForm] = useState({
     title: '',
     description: '',
-    category: 'Development',
+    category: 'Writing',
+    deliverableKind: 'article' as TextDeliverableKind,
     budgetZec: '',
     deadline: '',
     assignmentMode: 'application' as 'direct' | 'application',
@@ -34,6 +36,8 @@ export default function NewJobPage() {
       setError('Please fill in all required fields')
       return
     }
+    const policyError = validateTextJob(form)
+    if (policyError) { setError(policyError); return }
     let budgetZatoshis: number
     try { budgetZatoshis = parseZecToZatoshis(form.budgetZec) }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Enter a valid ZEC budget.'); return }
@@ -50,7 +54,8 @@ export default function NewJobPage() {
           title: form.title.trim(),
           description: form.description.trim(),
           category: form.category,
-          deadline: form.deadline || null,
+          deliverableKind: form.deliverableKind,
+          deadline: form.deadline ? new Date(form.deadline).toISOString() : null,
           assignmentMode: form.assignmentMode,
           budgetZatoshis,
         }),
@@ -70,7 +75,7 @@ export default function NewJobPage() {
 
   if (isLoading) return <div role="status" className="py-20 text-center"><Loader2 size={28} className="spin" style={{ margin: '0 auto 12px', color: 'var(--primary-dark)' }} />Restoring your wallet session…</div>
 
-  if (!isConnected || role !== 'client') {
+  if (!isConnected || !username || role !== 'client') {
     return (
       <div className="max-w-xl mx-auto px-4 py-20 text-center">
         <div className="card" style={{ padding: 40 }}>
@@ -113,10 +118,10 @@ export default function NewJobPage() {
       <div style={{ marginBottom: 32 }}>
         <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 6 }}>Post a Job</h1>
         <p style={{ color: 'var(--muted-2)', fontSize: 14 }}>
-          Describe your task clearly. The AI will use your description to judge submitted work.
+          Post a text deliverable with requirements GenLayer can assess from the submitted words.
         </p>
         <div className="card" style={{ padding: 16, marginTop: 20, background: 'var(--primary-glow)', fontSize: 13, lineHeight: 1.7 }}>
-          <strong>Testnet vault demo.</strong> Fund the job from your existing Zcash wallet after creation. The local Zallet vault holds the deposit and confirms funding before the job opens. An approved freelancer can request a shielded payout. Each job allows three judged submissions; provider failures do not use an attempt.
+          <strong>Text jobs only.</strong> {TEXT_JOB_SCOPE} Website builds, code, designs, images, files, external research, and links are disabled. Fund the testnet vault after creation. Each job allows three judged submissions; provider failures do not use an attempt.
         </div>
       </div>
 
@@ -129,7 +134,7 @@ export default function NewJobPage() {
           <input
             id="job-title"
             type="text"
-            placeholder="e.g. Build a React landing page, Write a blog post about DeFi…"
+            placeholder="e.g. Write a friendly product announcement"
             maxLength={200}
             value={form.title}
             onChange={(e) => setForm({ ...form, title: e.target.value })}
@@ -150,7 +155,7 @@ export default function NewJobPage() {
               onChange={(e) => setForm({ ...form, category: e.target.value })}
               style={{ width: '100%', padding: '12px 16px', fontSize: 14 }}
             >
-              {JOB_CATEGORIES.map((cat) => (
+              {SUPPORTED_JOB_CATEGORIES.map((cat) => (
                 <option key={cat} value={cat}>{cat}</option>
               ))}
             </select>
@@ -173,17 +178,24 @@ export default function NewJobPage() {
           </div>
         </div>
 
+        <div>
+          <label htmlFor="job-deliverable" style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 8, color: 'var(--muted-2)' }}>Text deliverable <span style={{ color: 'var(--gold)' }}>*</span></label>
+          <select id="job-deliverable" value={form.deliverableKind} onChange={(event) => setForm({ ...form, deliverableKind: event.target.value as TextDeliverableKind })} style={{ width: '100%', padding: '12px 16px', fontSize: 14 }}>
+            {TEXT_DELIVERABLE_KINDS.map(kind => <option key={kind} value={kind}>{TEXT_DELIVERABLE_LABELS[kind]}</option>)}
+          </select>
+        </div>
+
         {/* Description */}
         <div>
           <label htmlFor="job-description" style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 8, color: 'var(--muted-2)' }}>
             Task Description <span style={{ color: 'var(--gold)' }}>*</span>
           </label>
           <p style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 8 }}>
-            These public requirements become the GenLayer rubric. Use one criterion per line, with up to 12 criteria. Keep personal and payment details out of the description.
+            Use one criterion per line, up to 12. Specify tone, structure, length, and required wording. For translation, edits, or summaries, paste the source text into the relevant criterion. Avoid requirements that need external verification.
           </p>
           <textarea
             id="job-description"
-            placeholder="Describe exactly what you need. Put each acceptance criterion on a separate line (up to 12)."
+            placeholder={'Write a 150–200 word announcement for a reusable water bottle.\nUse a friendly tone and three short paragraphs.\nInclude the phrase "Refill, reuse, repeat" and a call to action.'}
             minLength={20}
             maxLength={12000}
             value={form.description}
@@ -196,15 +208,16 @@ export default function NewJobPage() {
         {/* Deadline */}
         <div>
           <label htmlFor="job-deadline" style={{ display: 'block', fontSize: 13, fontWeight: 500, marginBottom: 8, color: 'var(--muted-2)' }}>
-            Deadline (optional)
+            Delivery deadline (defaults to 7 days)
           </label>
           <input
             id="job-deadline"
-            type="date"
+            type="datetime-local"
             value={form.deadline}
             onChange={(e) => setForm({ ...form, deadline: e.target.value })}
             style={{ padding: '12px 16px', fontSize: 14 }}
           />
+          <p style={{ fontSize: 12, color: 'var(--muted-2)', marginTop: 8 }}>Choose one hour to 90 days from now. All revisions are due before this deadline. If unfinished, the client can close the job and request a refund.</p>
         </div>
 
         {/* Assignment mode */}
@@ -252,7 +265,7 @@ export default function NewJobPage() {
           <Info size={15} style={{ color: 'var(--primary-dark)', flexShrink: 0, marginTop: 1 }} />
           <p style={{ fontSize: 12, color: 'var(--muted-2)', lineHeight: 1.6 }}>
             <strong style={{ color: 'var(--primary-dark)' }}>AI-Powered Judgment:</strong> GenLayer’s
-            Intelligent Contract evaluates the public delivered text against your requirements. GenLayer records the verdict. The demo Zallet vault handles the deposit and the freelancer’s separately requested payout.
+            Intelligent Contract first checks that your rubric can be evaluated entirely from pasted text, then evaluates the delivered text against that frozen rubric. The native Zcash vault handles funding and the approved freelancer’s claim.
           </p>
         </div>
 

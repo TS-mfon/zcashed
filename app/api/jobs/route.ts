@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getAllJobs, getJobsByClient, getJobsByWorker } from '@/lib/store'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
 import { createJobFromIntent, creationKey } from '@/lib/job-creation'
-import { JOB_CATEGORIES, type Job } from '@/lib/types'
+import type { Job } from '@/lib/types'
+import { validateTextJob, TEXT_REVIEW_POLICY, type TextDeliverableKind } from '@/lib/job-policy'
+import { normalizeJobDeadline, JobLifecycleError } from '@/lib/job-lifecycle'
 
 export const maxDuration = 180
 const MAX_ZATOSHIS = 21_000_000 * 100_000_000
@@ -11,13 +13,13 @@ export async function GET(req: NextRequest) {
   try {
     const address = new URL(req.url).searchParams.get('address')
     if (address) {
-      requireActor(req, address)
-      const [posted, working] = await Promise.all([getJobsByClient(address), getJobsByWorker(address)])
+      const actor = requireActor(req, address)
+      const [posted, working] = await Promise.all([getJobsByClient(actor), getJobsByWorker(actor)])
       return NextResponse.json({ posted, working })
     }
     return NextResponse.json({ jobs: await getAllJobs() })
   } catch (error) {
-    return apiErrorResponse(error)
+    return apiErrorResponse(error instanceof JobLifecycleError ? new ApiError(error.status, error.message) : error)
   }
 }
 
@@ -32,7 +34,7 @@ export async function POST(req: NextRequest) {
     const job = await createJobFromIntent(clientAddress, key, offer)
     return NextResponse.json({ job }, { status: 201 })
   } catch (error) {
-    return apiErrorResponse(error)
+    return apiErrorResponse(error instanceof JobLifecycleError ? new ApiError(error.status, error.message) : error)
   }
 }
 
@@ -43,17 +45,17 @@ function jobInput(body: Record<string, unknown>) {
   const budgetZatoshis = body.budgetZatoshis
   if (typeof budgetZatoshis !== 'number' || !Number.isSafeInteger(budgetZatoshis) ||
       budgetZatoshis <= 0 || budgetZatoshis > MAX_ZATOSHIS) throw new ApiError(400, 'Valid budget in integer zatoshis required')
-  const category = body.category ?? 'Other'
-  if (typeof category !== 'string' || !JOB_CATEGORIES.includes(category as typeof JOB_CATEGORIES[number])) throw new ApiError(400, 'Invalid category')
+  const category = body.category ?? 'Writing'
+  if (typeof category !== 'string') throw new ApiError(400, 'Choose a writing or marketing text job.')
+  const deliverableKind = body.deliverableKind ?? 'article'
+  const policyError = validateTextJob({ title, description, category, deliverableKind })
+  if (policyError) throw new ApiError(400, policyError)
   const assignmentMode = body.assignmentMode ?? 'application'
   if (assignmentMode !== 'direct' && assignmentMode !== 'application') throw new ApiError(400, 'Invalid assignment mode')
-  let deadline: string | null = null
-  if (body.deadline !== undefined && body.deadline !== null && body.deadline !== '') {
-    if (typeof body.deadline !== 'string' || !Number.isFinite(Date.parse(body.deadline))) throw new ApiError(400, 'Invalid deadline')
-    deadline = new Date(body.deadline).toISOString()
-  }
+  const deadline = normalizeJobDeadline(body.deadline)
   return { title, description, budgetZatoshis, budgetZec: budgetZatoshis / 100_000_000,
-    category, assignmentMode: assignmentMode as Job['assignmentMode'], deadline }
+    category, deliverableKind: deliverableKind as TextDeliverableKind, reviewPolicy: TEXT_REVIEW_POLICY,
+    assignmentMode: assignmentMode as Job['assignmentMode'], deadline }
 }
 
 function boundedText(value: unknown, label: string, minimum: number, maximum: number): string {

@@ -7,6 +7,8 @@ import VaultPanel from '@/components/VaultPanel'
 import { StatusBadge } from '@/components/StatusBadge'
 import { Job, Application } from '@/lib/types'
 import { formatZatoshis } from '@/lib/zcash'
+import { validateTextJob, validateTextSubmission } from '@/lib/job-policy'
+import { isJobExpired, jobDeadline } from '@/lib/job-lifecycle'
 import { timeAgo, categoryIcon, shortenAddress } from '@/lib/utils'
 import {
   Clock, User, CheckCircle, XCircle, Loader2, Brain, AlertCircle,
@@ -24,7 +26,7 @@ async function fetchJobDetail(id: string, signal?: AbortSignal): Promise<Job | n
 export default function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
   const router = useRouter()
-  const { address, isConnected, role } = useWallet()
+  const { address, username, isConnected, role } = useWallet()
 
   const [job, setJob] = useState<Job | null>(null)
   const [loading, setLoading] = useState(true)
@@ -35,11 +37,9 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const [aiFeedback, setAiFeedback] = useState('')
 
   const [submissionText, setSubmissionText] = useState<string | null>(null)
-  const [submissionUrl, setSubmissionUrl] = useState<string | null>(null)
   const [coverLetter, setCoverLetter] = useState('')
   const latestSub = (job?.submissions ?? []).slice().sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
   const deliveredText = submissionText ?? latestSub?.notes ?? ''
-  const deliveredUrl = submissionUrl ?? latestSub?.submissionUrl ?? ''
   const judgedAttempts = (job?.submissions ?? []).filter((submission) => submission.status !== 'pending' && submission.status !== 'reviewing').length
   const remainingAttempts = Math.max(0, 3 - judgedAttempts)
 
@@ -110,16 +110,13 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     e.preventDefault()
     if (!address || !job) return
     if (!remainingAttempts) { setError('All three judged review attempts have been used.'); return }
-    if (deliveredText.trim().length < 20) { setError('Include the actual delivered work (at least 20 characters) for public review.'); return }
-    if (deliveredUrl.trim()) {
-      try { if (new URL(deliveredUrl.trim()).protocol !== 'https:') throw new Error() }
-      catch { setError('Use an HTTPS deliverable link or leave the optional link blank.'); return }
-    }
+    const policyError = validateTextJob(job) ?? validateTextSubmission(deliveredText)
+    if (policyError) { setError(policyError); return }
     setError(''); setSubmitting(true); setSubState('evaluating')
     try {
       const res = await fetch('/api/submit', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobId: job.id, workerAddress: address, submissionText: deliveredText.trim(), submissionUrl: deliveredUrl.trim(), attempt: judgedAttempts + 1 }),
+        body: JSON.stringify({ jobId: job.id, workerAddress: address, submissionText: deliveredText.trim(), attempt: judgedAttempts + 1 }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
@@ -140,9 +137,11 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const budgetLabel = `${formatZatoshis(job.budgetZatoshis)} ZEC`
   const isWorker = address === job.workerAddress
   const myApp = (job.applications ?? []).find((a) => a.applicantAddress === address)
-  const canAcceptDirect = isConnected && role === 'freelancer' && job.assignmentMode === 'direct' && job.status === 'open' && !isClient && !job.workerAddress
-  const canApply = isConnected && role === 'freelancer' && job.assignmentMode === 'application' && job.status === 'open' && !isClient && !myApp
-  const canSubmit = isWorker && remainingAttempts > 0 && (job.status === 'in_progress' || job.status === 'needs_revision') && subState === 'idle'
+  const scopeError = validateTextJob(job)
+  const expired = isJobExpired(job)
+  const canAcceptDirect = !expired && !scopeError && !!username && isConnected && role === 'freelancer' && job.assignmentMode === 'direct' && job.status === 'open' && !isClient && !job.workerAddress
+  const canApply = !expired && !scopeError && !!username && isConnected && role === 'freelancer' && job.assignmentMode === 'application' && job.status === 'open' && !isClient && !myApp
+  const canSubmit = !expired && !scopeError && !!username && isWorker && remainingAttempts > 0 && (job.status === 'in_progress' || job.status === 'needs_revision') && subState === 'idle'
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-10">
@@ -165,7 +164,8 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
             <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 8 }}>{job.title}</h1>
             <div className="flex flex-wrap gap-4" style={{ fontSize: 12, color: 'var(--muted)' }}>
               <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Clock size={12} /> {timeAgo(job.createdAt)}</span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><User size={12} /> {shortenAddress(job.clientAddress, 8)}</span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Clock size={12} /> Due {new Date(jobDeadline(job)).toLocaleString()}</span>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><User size={12} /> {job.clientUsername ? '@' + job.clientUsername : 'Client'}</span>
               {job.assignmentMode === 'application' && <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Users size={12} /> {(job.applications ?? []).length} applicant{(job.applications ?? []).length !== 1 ? 's' : ''}</span>}
             </div>
           </div>
@@ -176,6 +176,10 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
         </div>
         <div style={{ borderTop: '1px solid var(--border)', paddingTop: 20, fontSize: 14, color: 'var(--muted-2)', lineHeight: 1.8, whiteSpace: 'pre-wrap' }}>{job.description}</div>
       </div>
+
+      {scopeError && <div className="card" role="status" style={{ padding: 20, marginBottom: 20, fontSize: 13, lineHeight: 1.7 }}><strong>This job type is disabled.</strong> {scopeError} Existing approved claims and eligible refunds remain available.</div>}
+      {expired && ['funding_required', 'open', 'in_progress', 'needs_revision'].includes(job.status) && <div className="card" role="status" style={{ padding: 20, marginBottom: 20, fontSize: 13, lineHeight: 1.7 }}><strong>The job deadline has passed.</strong> New work is closed. The client can close an unfinished job and authorize a refund. A review already dispatched must finish reconciliation first.</div>}
+      {isConnected && !username && <div className="card" style={{ padding: 20, marginBottom: 20 }}>Sign in with your username to apply, submit work, or manage this job. <Link href="/onboarding">Continue to your account</Link></div>}
 
       {(isClient || isWorker) && job.vaultAddress && ['funding_required', 'approved', 'claiming', 'completed', 'rejected', 'cancelled', 'refunding', 'refunded'].includes(job.status) && <VaultPanel job={job} actorAddress={address} onChange={loadJob} />}
       {job.status === 'funding_required' && !isClient && <div className="card" style={{ padding: 24, marginBottom: 20 }}>
@@ -193,7 +197,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       {job.workerAddress && (
         <div style={{ background: 'var(--primary-glow)', border: '1px solid rgba(245,184,0,0.3)', borderRadius: 10, padding: '14px 20px', marginBottom: 20, display: 'flex', alignItems: 'center', gap: 10 }}>
           <Award size={16} style={{ color: 'var(--primary-dark)' }} />
-          <span style={{ fontSize: 13, color: 'var(--muted-2)' }}>Assigned to <code style={{ fontSize: 12, color: 'var(--text)' }}>{shortenAddress(job.workerAddress, 8)}</code></span>
+          <span style={{ fontSize: 13, color: 'var(--muted-2)' }}>Assigned to <code style={{ fontSize: 12, color: 'var(--text)' }}>{job.workerUsername ? '@' + job.workerUsername : shortenAddress(job.workerAddress, 8)}</code></span>
         </div>
       )}
 
@@ -250,7 +254,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       )}
 
       {/* Client: review applicants */}
-      {isClient && job.assignmentMode === 'application' && job.status === 'open' && (
+      {!expired && !scopeError && isClient && job.assignmentMode === 'application' && job.status === 'open' && (
         <div className="card" style={{ padding: '24px 28px', marginBottom: 20 }}>
           <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}><Users size={18} /> Applicants ({(job.applications ?? []).length})</h3>
           <p style={{ fontSize: 13, color: 'var(--muted-2)', marginBottom: 18 }}>Review and pick who to hire. The rest are automatically notified.</p>
@@ -284,7 +288,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
             <Brain size={20} color="var(--primary-dark)" /><h3 style={{ fontSize: 18, fontWeight: 700 }}>Submit your work</h3>
           </div>
-          <p style={{ fontSize: 13, color: 'var(--muted-2)', marginBottom: 20 }}>Submit the actual delivered text for GenLayer review. The submitted text is public. Keep wallet addresses, payment details, and personal information out of it.</p>
+          <p style={{ fontSize: 13, color: 'var(--muted-2)', marginBottom: 20 }}>Paste the complete article, copy, translation, edit, or summary for GenLayer review. Links, code, designs, and attachments are disabled. The text is public; keep wallet and personal details out of it.</p>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>Attempt {Math.min(3, judgedAttempts + 1)} of 3</div>
           <p style={{ fontSize: 12, color: 'var(--muted-2)', lineHeight: 1.6, marginBottom: 18 }}>You have {remainingAttempts} judged attempt{remainingAttempts === 1 ? '' : 's'} left. An unavailable or pending provider does not use an attempt.</p>
           {job.status === 'needs_revision' && latestSub?.aiFeedback && (
@@ -296,11 +300,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           <form onSubmit={handleSubmitWork} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             <div>
               <label htmlFor="submission-text" style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Delivered work (public) <span style={{ color: 'var(--gold)' }}>*</span></label>
-              <textarea id="submission-text" value={deliveredText} onChange={(event) => setSubmissionText(event.target.value)} placeholder="Paste the actual deliverable for the judge to evaluate. A short description or URL alone is insufficient." minLength={20} maxLength={12000} required style={{ width: '100%', padding: '12px 14px', fontSize: 14, minHeight: 220 }} />
-            </div>
-            <div>
-              <label htmlFor="submission-url" style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Deliverable URL (optional)</label>
-              <input id="submission-url" type="url" value={deliveredUrl} onChange={(event) => setSubmissionUrl(event.target.value)} placeholder="https://github.com/… or a link to your deliverable" maxLength={2048} style={{ width: '100%', padding: '12px 14px', fontSize: 14 }} />
+              <textarea id="submission-text" value={deliveredText} onChange={(event) => setSubmissionText(event.target.value)} placeholder="Paste the complete text deliverable. It will be reviewed against the job's frozen requirements." minLength={20} maxLength={12000} required style={{ width: '100%', padding: '12px 14px', fontSize: 14, minHeight: 220 }} />
             </div>
             <button type="submit" disabled={submitting} className="btn btn-primary" style={{ padding: 14, fontSize: 15 }}>Submit for AI Review →</button>
           </form>

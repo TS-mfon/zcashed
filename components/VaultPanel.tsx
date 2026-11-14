@@ -6,12 +6,34 @@ import { Copy, LockKeyhole, ShieldCheck } from 'lucide-react'
 import type { Job } from '@/lib/types'
 import { buildPaymentRequest, formatZatoshis, parseShieldedAddress } from '@/lib/zcash'
 import { useWallet } from './WalletContext'
+import { cancellationEligibility, isJobExpired, jobDeadline } from '@/lib/job-lifecycle'
+import { validateTextJob } from '@/lib/job-policy'
 
 type Operation = { purpose: 'worker_payout' | 'client_refund'; state: string; txid?: string; confirmations: number; message: string }
 type Props = { job: Job; actorAddress: string | null; onChange: () => void | Promise<void> }
 
+function VaultFeeStatus({ jobId, jobStatus }: { jobId: string; jobStatus: Job['status'] }) {
+  const [fees, setFees] = useState<{ ready: boolean; shortfallZatoshis: number; pendingPayouts: number } | null>(null)
+  const [error, setError] = useState('')
+  const [refresh, setRefresh] = useState(0)
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`/api/jobs/${encodeURIComponent(jobId)}/vault-fees`, { cache: 'no-store', credentials: 'same-origin', signal: controller.signal })
+      .then(async response => {
+        const data = await response.json()
+        if (!response.ok || !data.fees) throw new Error(data.error ?? 'Fee status is unavailable.')
+        if (!controller.signal.aborted) { setFees(data.fees); setError('') }
+      }).catch(cause => { if (!controller.signal.aborted) { setFees(null); setError(cause instanceof Error ? cause.message : 'Fee status is unavailable.') } })
+    return () => controller.abort()
+  }, [jobId, jobStatus, refresh])
+  return <div role="status" style={{ fontSize: 13, lineHeight: 1.7, marginBottom: 16 }}>
+    {error ? 'Vault fee status unavailable. Releases wait for the operator wallet.' : !fees ? 'Loading vault fee reserve…' : fees.pendingPayouts ? 'A wallet transfer is awaiting confirmation. Further releases wait for confirmation.' : fees.ready ? 'Job deposits are protected. The operator fee reserve is ready.' : `The operator must top up its fee reserve by at least ${formatZatoshis(fees.shortfallZatoshis)} testnet ZEC before release. Your job deposit is protected.`}
+    <button type="button" className="btn btn-ghost" onClick={() => setRefresh(value => value + 1)} style={{ marginLeft: 8, fontSize: 12 }}>Refresh fee status</button>
+  </div>
+}
+
 export default function VaultPanel({ job, actorAddress, onChange }: Props) {
-  const { requestWalletPayment } = useWallet()
+  const { requestWalletPayment, username } = useWallet()
   const client = actorAddress === job.clientAddress
   const worker = !!job.workerAddress && actorAddress === job.workerAddress
   const funded = !!job.fundedAt && job.fundedZatoshis >= job.budgetZatoshis
@@ -26,12 +48,18 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
   const [walletRequest, setWalletRequest] = useState<{ uri: string; state: 'pending' | 'submitted' | 'uncertain' } | null>(null)
   const operation = receipt?.jobId === job.id ? receipt.operation : null
   const operationLoaded = receipt?.jobId === job.id
+  const expired = isJobExpired(job)
+  const supported = !validateTextJob(job)
+  let canClose = false
+  if (client && username && !operation) {
+    try { cancellationEligibility(job, supported); canClose = true } catch {}
+  }
   const payment = useMemo(() => {
-    if (!client || job.status !== 'funding_required') return null
+    if (!client || job.status !== 'funding_required' || expired || !supported) return null
     try {
       return buildPaymentRequest({ address: job.vaultAddress, network: 'testnet', amountZatoshis: job.budgetZatoshis, memo: job.vaultReference })
     } catch { return null }
-  }, [client, job.status, job.vaultAddress, job.vaultReference, job.budgetZatoshis])
+  }, [client, expired, supported, job.status, job.vaultAddress, job.vaultReference, job.budgetZatoshis])
 
   useEffect(() => {
     if (!payment) return
@@ -65,7 +93,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
       if (!response.ok) {
         // The claim API's 400 responses precede any durable reservation or broadcast.
         // Other failures can occur after a send, so they keep a new claim disabled.
-        if (path !== 'funding' && response.status === 400) setSubmitted(false)
+        if (path !== 'funding' && (response.status === 400 || (data.stage === 'prebroadcast' && data.retryable === true))) setSubmitted(false)
         throw new Error(data.error ?? 'The vault action could not be completed.')
       }
       if (path === 'funding') setNotice(data.received ? 'The wallet confirmed your exact deposit. ' + (data.job?.status === 'open' ? 'The job is now open.' : 'The deposit remains available for a client refund.') : 'No confirmed matching deposit yet. Wait for a block and check again.')
@@ -99,6 +127,19 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
     catch { setError('Clipboard unavailable. Select and copy the request below.') }
   }
 
+  async function closeJob() {
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`, { method: 'PUT', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'cancelled' }) })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error ?? 'The job could not be closed.')
+      setNotice(data.message ?? 'Job closed. Authorize a refund to your wallet below.')
+      await onChange()
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'The job could not be closed.') }
+    finally { setBusy(false) }
+  }
+
   async function payWithZucchini() {
     if (!payment || walletRequest?.uri === payment.uri || busy) return
     setWalletRequest({ uri: payment.uri, state: 'pending' })
@@ -127,6 +168,11 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
       <p style={{ fontWeight: 700, fontSize: 18, marginBottom: 16 }}>
         {formatZatoshis(job.budgetZatoshis)} testnet ZEC · {job.status === 'refunded' ? 'Refund confirmed' : job.status === 'refunding' ? 'Refund pending' : job.status === 'completed' ? 'Payout confirmed' : funded ? 'Deposit confirmed' : 'Awaiting deposit'}
       </p>
+      {(client || worker) && username && <VaultFeeStatus jobId={job.id} jobStatus={job.status} />}
+      {canClose && <div style={{ padding: 16, border: '1px solid var(--border)', borderRadius: 12, marginBottom: 20 }}>
+        <p style={{ fontSize: 13, lineHeight: 1.7, marginBottom: 12 }}>{!supported ? 'This job requires an unsupported deliverable. Close it to request a refund.' : expired ? 'The deadline passed without an approved deliverable. Close the job to request a refund.' : 'You can cancel before a freelancer is assigned. All revisions are due by ' + new Date(jobDeadline(job)).toLocaleString() + '.'}</p>
+        <button type="button" className="btn btn-outline" disabled={busy || !operationLoaded} onClick={() => void closeJob()}>{busy ? 'Closing job…' : 'Close job and enable refund'}</button>
+      </div>}
 
       {client && job.status === 'funding_required' && payment && (
         <div>
@@ -150,7 +196,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
           <p style={{ color: 'var(--muted-2)', fontSize: 12, lineHeight: 1.7, marginTop: 12 }}>The job opens after the vault receives the exact amount and unique memo in a confirmed shielded transaction. Each transaction funds one job. The payment request itself does not confirm funds.</p>
         </div>
       )}
-      {client && job.status === 'funding_required' && !payment && <p role="alert">The stored vault request is invalid. Contact the operator before sending funds.</p>}
+      {client && job.status === 'funding_required' && !payment && !expired && supported && <p role="alert">The stored vault request is invalid. Contact the operator before sending funds.</p>}
       {client && ['cancelled', 'rejected'].includes(job.status) && !funded && (
         <div>
           <p style={{ fontSize: 13, lineHeight: 1.7 }}>If you sent a deposit before the job closed, check the wallet for its confirmed receipt. The job will stay closed, and a verified deposit can be refunded.</p>

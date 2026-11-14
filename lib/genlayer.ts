@@ -82,6 +82,11 @@ export async function acknowledgeReview(address: string, content: string, actor:
   await acknowledgeOperation(operationKey(contractAddress(address), 'submit_work', [content.trim(), workerDemoId(actor)], String(attempt)))
 }
 
+export async function hasRecoverableReview(address: string, content: string, actor: string, attempt: number): Promise<boolean> {
+  const entry = (await readOperationJournal())[operationKey(contractAddress(address), 'submit_work', [content.trim(), workerDemoId(actor)], String(attempt))]
+  return Boolean(entry?.hash && (entry.pending || !entry.settled))
+}
+
 export async function withJobOperation<T>(jobId: string, operation: () => Promise<T>): Promise<T> {
   const lease = await acquireJobLease(jobId)
   try { return await operation() }

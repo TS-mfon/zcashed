@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
 import { getJob } from '@/lib/store'
-import { refundJobPayment, VaultError } from '@/lib/vault'
+import { refundJobPayment, VaultError, VaultPreflightError } from '@/lib/vault'
 import { ZalletError } from '@/lib/zallet'
 import { hasUnsettledJobOperation, withJobOperation, GenLayerBusyError } from '@/lib/genlayer'
 
@@ -28,6 +28,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return NextResponse.json(result, { status: result.job.status === 'refunded' ? 200 : 202, headers: { 'Cache-Control': 'private, no-store' } })
     })
   } catch (error) {
+    if (error instanceof VaultPreflightError) return NextResponse.json({ error: error.message, stage: 'prebroadcast', retryable: true }, { status: error.status, headers: { 'Cache-Control': 'private, no-store' } })
     return apiErrorResponse(error instanceof GenLayerBusyError ? new ApiError(409, error.message) : error instanceof VaultError || error instanceof ZalletError ? new ApiError(error.status, error.message) : error)
   }
 }

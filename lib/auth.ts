@@ -11,7 +11,7 @@ export const SESSION_COOKIE = 'zcashed_session'
 const SESSION_SECONDS = 8 * 60 * 60
 const CHALLENGE_SECONDS = 5 * 60
 type Network = 'mainnet' | 'testnet'
-type Session = { v: 1; kind: 'session'; id: string; walletAddress: string; network: Network; exp: number }
+type Session = { v: 1; kind: 'session'; id: string; walletAddress: string; network: Network; exp: number; username?: string }
 type Challenge = { v: 1; kind: 'challenge'; walletAddress: string; unifiedAddress?: string; network: Network; origin: string; nonce: string; message: string; exp: number }
 let consumed = new Map<string, number>()
 let limits = new Map<string, { count: number; until: number }>()
@@ -53,7 +53,8 @@ function readToken(token: string | undefined): Session | Challenge | null {
     const data = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
     if (data.v !== 1 || !Number.isSafeInteger(data.exp) || data.exp <= Date.now() || typeof data.walletAddress !== 'string') return null
     if (data.network !== 'testnet') return null
-    if (data.kind === 'session' && /^user_[a-f0-9]{64}$/.test(data.id)) return data
+    if (data.kind === 'session' && /^user_[a-f0-9]{64}$/.test(data.id) &&
+        (data.username === undefined || /^[a-z0-9_]{3,24}$/.test(data.username))) return data
     if (data.kind === 'challenge' && typeof data.message === 'string' && typeof data.origin === 'string' && /^[a-f0-9]{32}$/.test(data.nonce)) return data
     return null
   } catch { return null }
@@ -80,13 +81,24 @@ export function getSession(req: NextRequest): Session | null {
   return token?.kind === 'session' ? token : null
 }
 
-export function requireActor(req: NextRequest, claimed?: unknown): string {
+export function requireActor(req: NextRequest, claimed?: unknown, allowUnregistered = false): string {
   if (req.method !== 'GET') assertSameOrigin(req)
   const session = getSession(req)
   if (!session) throw new ApiError(401, 'Connect your existing wallet before continuing.')
-  if (claimed !== undefined && claimed !== session.id) throw new ApiError(403, 'This action belongs to a different account.')
+  if (!allowUnregistered && !session.username) throw new ApiError(401, 'Create your username or sign in before continuing.')
+  if (claimed !== undefined && claimed !== session.id && claimed !== session.username) throw new ApiError(403, 'This action belongs to a different account.')
   rateLimit(session.id)
   return session.id
+}
+
+export function accountSessionResponse(req: NextRequest, account: { username: string; actorId: string }): NextResponse {
+  const connected = getSession(req)
+  if (!connected) throw new ApiError(401, 'Connect your existing wallet before signing in.')
+  const seconds = 30 * 24 * 60 * 60
+  const payload: Session = { ...connected, id: account.actorId, username: account.username, exp: Date.now() + seconds * 1000 }
+  const response = NextResponse.json({ address: payload.id, walletAddress: payload.walletAddress, network: payload.network, username: payload.username })
+  response.cookies.set(SESSION_COOKIE, sign(payload), { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', path: '/', maxAge: seconds })
+  return response
 }
 
 export function createWalletChallenge(req: NextRequest, address: unknown, unifiedAddress?: unknown): { message: string; challengeToken: string; expiresAt: string } {
@@ -144,9 +156,9 @@ export async function connectWallet(req: NextRequest, challengeToken: unknown, s
   return response
 }
 
-// Zucchini's ordinary connection grants address access, not a native-message
-// signature. Account authority therefore comes from this browser's signed,
-// server-issued capability cookie. An address never recovers another account.
+// Zucchini grants address access, not native-message signing. New connections
+// remain provisional until username/password registration or sign-in. The
+// authenticated account survives reconnect through its recoverable credentials.
 export function connectBrowserWallet(req: NextRequest, address: unknown): NextResponse {
   assertSameOrigin(req)
   rateLimit('browser-connect:' + (req.headers.get('x-forwarded-for')?.split(',')[0] || 'local'), 20)
@@ -158,8 +170,8 @@ export function connectBrowserWallet(req: NextRequest, address: unknown): NextRe
   const existing = getSession(req)
   const seconds = 30 * 24 * 60 * 60
   const payload: Session = { v: 1, kind: 'session', id: existing?.id ?? 'user_' + randomBytes(32).toString('hex'),
-    walletAddress: unified, network: 'testnet', exp: Date.now() + seconds * 1000 }
-  const response = NextResponse.json({ address: payload.id, walletAddress: unified, network: 'testnet' })
+    walletAddress: unified, network: 'testnet', exp: Date.now() + seconds * 1000, ...(existing?.username ? { username: existing.username } : {}) }
+  const response = NextResponse.json({ address: payload.id, walletAddress: unified, network: 'testnet', username: payload.username ?? null })
   response.cookies.set(SESSION_COOKIE, sign(payload), { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', path: '/', maxAge: seconds })
   return response
 }

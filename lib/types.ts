@@ -34,6 +34,7 @@ export type NotificationType =
 
 export interface Profile {
   address: string
+  username?: string
   displayName: string
   role: Role
   bio: string
@@ -46,11 +47,15 @@ export interface Job {
   title: string
   description: string
   category: string
+  reviewPolicy?: 'public-text-v1'
+  deliverableKind?: 'article' | 'copy' | 'translation' | 'editing' | 'summary'
   budgetZec: number
   budgetZatoshis: number
   assignmentMode: AssignmentMode
   clientAddress: string
   workerAddress: string
+  clientUsername?: string
+  workerUsername?: string
   vaultAddress: string
   vaultReference: string
   vaultNetwork: 'testnet'
@@ -59,6 +64,8 @@ export interface Job {
   status: JobStatus
   genlayerContractAddress: string
   deadline: string | null
+  cancellationReason?: 'client_cancelled' | 'deadline_expired' | 'unsupported_job'
+  cancelledAt?: string
   createdAt: string
   updatedAt: string
   submissions: Submission[]
