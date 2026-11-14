@@ -329,7 +329,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
       {subState === 'approved' && job.status === 'approved' && (
         <div className="card" style={{ padding: '48px 32px', textAlign: 'center', marginBottom: 20, border: '1px solid rgba(245,184,0,0.5)', background: 'var(--primary-glow)' }}>
           <CheckCircle size={48} color="var(--primary-dark)" style={{ margin: '0 auto 16px' }} />
-          <h3 style={{ fontSize: 24, fontWeight: 800, marginBottom: 8, color: 'var(--primary-dark)' }}>Work Approved! 🎉</h3>
+          <h3 style={{ fontSize: 24, fontWeight: 800, marginBottom: 8, color: 'var(--primary-dark)' }}>Work approved</h3>
           <p style={{ fontSize: 14, color: 'var(--muted-2)', marginBottom: 20, lineHeight: 1.6 }}>GenLayer stored an approved work verdict. <strong>{budgetLabel}</strong> is claimable from the funded testnet vault. Use the private claim form to authorize its transfer to your own wallet.</p>
           <div><button onClick={() => router.push('/dashboard')} className="btn btn-primary">View Dashboard</button></div>
         </div>
