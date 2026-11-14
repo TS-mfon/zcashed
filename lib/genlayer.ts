@@ -157,7 +157,20 @@ async function successfulFinalization(client: ReturnType<typeof getClient>, hash
 function executionFailed(receipt: GenLayerTransaction): boolean {
   if (receipt.txExecutionResultName !== undefined) return receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR
   if (receipt.txExecutionResult !== undefined) return receipt.txExecutionResult === 2
-  return receipt.consensus_data?.leader_receipt?.some((leader) => leader.execution_result === 'ERROR') ?? false
+  const entries = receipt.consensus_data?.leader_receipt
+  if (!Array.isArray(entries) || !entries.length || entries.some((entry) => !entry || typeof entry !== 'object')) return false
+  const rolesKnown = entries.some((entry) => entry.mode !== undefined && entry.mode !== null && entry.mode !== '')
+  if (rolesKnown && entries.some((entry) => entry.mode !== 'leader' && entry.mode !== 'validator')) return false
+  const leaders = rolesKnown ? entries.filter((entry) => entry.mode === 'leader') : entries
+  const raw = receipt as unknown as Record<string, unknown>
+  const consensus = raw.consensus_data as Record<string, unknown> | undefined
+  const selectors = [receipt.lastLeader, raw.last_leader, consensus?.last_leader].filter((value) => value !== undefined && value !== null)
+  if (selectors.some((value) => typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value))) return false
+  const selected = selectors[0] as string | undefined
+  if (selected && selectors.some((value) => (value as string).toLowerCase() !== selected.toLowerCase())) return false
+  const canonical = selected ? leaders.filter((entry) => typeof entry.node_config?.address === 'string' &&
+    entry.node_config.address.toLowerCase() === selected.toLowerCase()) : leaders
+  return canonical.length === 1 && canonical[0].execution_result === 'ERROR'
 }
 
 function executionSucceeded(receipt: GenLayerTransaction): boolean {
@@ -169,11 +182,30 @@ function executionSucceeded(receipt: GenLayerTransaction): boolean {
     return executionResultNumberToName[String(receipt.txExecutionResult) as keyof typeof executionResultNumberToName] ===
       ExecutionResult.FINISHED_WITH_RETURN
   }
-  // Studio serializes Receipt.execution_result using ExecutionResultStatus.SUCCESS.
-  // Primary source: genlayer-studio/backend/node/types.py. Missing evidence fails closed.
-  const leaders = receipt.consensus_data?.leader_receipt
-  return Array.isArray(leaders) && leaders.length > 0 &&
-    leaders.every((leader) => leader.execution_result === 'SUCCESS')
+  // Studio can include cancelled validator receipts in leader_receipt after quorum.
+  // Select the actual leader; ambiguous roles or leader identity remain unverified.
+  const entries = receipt.consensus_data?.leader_receipt
+  if (!Array.isArray(entries) || !entries.length || entries.some((entry) => !entry || typeof entry !== 'object')) return false
+  const rolesKnown = entries.some((entry) => entry.mode !== undefined && entry.mode !== null && entry.mode !== '')
+  if (rolesKnown && entries.some((entry) => entry.mode !== 'leader' && entry.mode !== 'validator')) return false
+  const leaders = rolesKnown ? entries.filter((entry) => entry.mode === 'leader') : entries
+  const raw = receipt as unknown as Record<string, unknown>
+  const consensus = raw.consensus_data as Record<string, unknown> | undefined
+  const selectors = [receipt.lastLeader, raw.last_leader, consensus?.last_leader].filter((value) => value !== undefined && value !== null)
+  if (selectors.some((value) => typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value))) return false
+  const selected = selectors[0] as string | undefined
+  if (selected && selectors.some((value) => (value as string).toLowerCase() !== selected.toLowerCase())) return false
+  const canonical = selected ? leaders.filter((entry) => typeof entry.node_config?.address === 'string' &&
+    entry.node_config.address.toLowerCase() === selected.toLowerCase()) : leaders
+  if (canonical.length !== 1 || canonical[0].execution_result !== 'SUCCESS') return false
+  const leader = canonical[0]
+  const result = leader.result as unknown as { status?: unknown } | undefined
+  const genvm = (leader as unknown as { genvm_result?: { raw_error?: unknown; error_code?: unknown; error_description?: unknown } }).genvm_result
+  return !!result && typeof result === 'object' && !Array.isArray(result) && result.status === 'return' &&
+    (leader.error === undefined || leader.error === null || leader.error === '') &&
+    (genvm?.raw_error === undefined || genvm.raw_error === null) &&
+    (genvm?.error_code === undefined || genvm.error_code === null) &&
+    (genvm?.error_description === undefined || genvm.error_description === null)
 }
 
 export async function deployEscrowContract(params: {
