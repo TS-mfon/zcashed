@@ -21,6 +21,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     if (job.applications.some(application => application.applicantAddress === actor)) throw new ApiError(409, 'You already applied to this job.')
     const price = fields.proposedPrice === undefined || fields.proposedPrice === '' ? job.budgetZec : Number(fields.proposedPrice)
     if (!['undefined', 'number', 'string'].includes(typeof fields.proposedPrice) || !Number.isFinite(price) || price <= 0 || price > 21_000_000) throw new ApiError(400, 'Use a positive ZEC proposed price.')
+    if (price !== job.budgetZec) throw new ApiError(400, 'This job pays its fixed funded budget; negotiated bids are not supported.')
     const profile = await getProfile(actor)
     const application: Application = {id: generateId(), jobId: id, applicantAddress: actor, applicantName: profile?.displayName || '', coverLetter: fields.coverLetter as string ?? '', proposedPrice: price, status: 'pending', createdAt: new Date().toISOString()}
     await addApplication(application)

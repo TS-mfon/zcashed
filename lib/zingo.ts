@@ -2,6 +2,7 @@ import { MAX_ZATOSHIS, parseShieldedAddress } from './zcash'
 
 const TXID = /^[0-9a-f]{64}$/i
 export class ZingoError extends Error { readonly status = 503 }
+export class ZingoPrebroadcastError extends ZingoError {}
 export function zingoConfiguration() {
   const raw = process.env.ZINGO_RPC_URL?.trim()
   const user = process.env.ZINGO_RPC_USER
@@ -31,9 +32,14 @@ async function rpc(method: string, input: unknown, sending = false): Promise<unk
       headers: { 'Content-Type': 'application/json', Authorization: configuration.authorization },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params: [input] }), signal: AbortSignal.timeout(sending ? 90000 : 30000) })
     const envelope = object(await response.json())
+    if (sending && envelope.id === id && envelope.error && typeof envelope.error === 'object') {
+      const data = (envelope.error as {data?: {stage?: unknown; retryable?: unknown}}).data
+      if (data?.stage === 'prebroadcast' && data.retryable === true) throw new ZingoPrebroadcastError('The wallet confirmed that no transfer was broadcast. You can authorize another attempt.')
+    }
     if (!response.ok || envelope.id !== id || envelope.error || !Object.hasOwn(envelope, 'result')) throw new ZingoError('The native testnet wallet cannot complete this operation.')
     return envelope.result
   } catch (error) {
+    if (error instanceof ZingoPrebroadcastError) throw error
     if (sending) throw new ZingoError('Broadcast outcome is uncertain. The vault will not resend; the operator must reconcile the wallet.')
     if (error instanceof ZingoError) throw error
     throw new ZingoError('The native testnet vault service is unavailable.')
@@ -54,7 +60,7 @@ export async function verifyZingoDeposit(input: {address: string; reference: str
   if (typeof result.txid !== 'string' || !TXID.test(result.txid) || result.receiptId !== result.txid ||
       result.receiptType !== 'whole-shielded-account-transaction' || result.accountId !== '0' ||
       result.amountZatoshis !== input.amountZatoshis || result.memo !== input.reference || !positive(result.confirmations) ||
-      !Array.isArray(result.poolsReceived) || !result.poolsReceived.length || result.poolsReceived.some(pool => !['orchard', 'ironwood'].includes(String(pool)))) throw new ZingoError('The native wallet did not verify a matching shielded transaction receipt.')
+      !Array.isArray(result.poolsReceived) || !result.poolsReceived.length || result.poolsReceived.some(pool => !['orchard', 'ironwood'].includes(String(pool).toLowerCase()))) throw new ZingoError('The native wallet did not verify a matching shielded transaction receipt.')
   return { txid: result.txid.toLowerCase(), receiptId: result.txid.toLowerCase(), receiptType: 'whole-shielded-account-transaction' as const,
     amountZatoshis: input.amountZatoshis, confirmations: result.confirmations }
 }
@@ -78,4 +84,9 @@ export async function inspectZingoPayout(input: {txid: string; address: string; 
   const result = object(await rpc('vault_inspect_payout', input))
   if (typeof result.confirmed !== 'boolean' || typeof result.confirmations !== 'number' || !Number.isSafeInteger(result.confirmations) || result.confirmations < 0 || result.confirmed !== (result.confirmations > 0)) throw new ZingoError('The wallet returned an unsupported confirmation state.')
   return {confirmed: result.confirmed, confirmations: result.confirmations}
+}
+export async function releaseZingoPrebroadcast(memo: string): Promise<void> {
+  if (!memo || Buffer.byteLength(memo, 'utf8') > 512) throw new ZingoError('Invalid payout reservation memo.')
+  const result = object(await rpc('vault_release_prebroadcast', {memo}))
+  if (result.released !== true || result.stage !== 'prebroadcast' || result.retryable !== true) throw new ZingoError('The wallet has not proved that this reservation is safe to release.')
 }

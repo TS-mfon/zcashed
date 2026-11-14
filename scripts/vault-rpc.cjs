@@ -34,6 +34,9 @@ let writeQueue = Promise.resolve();
 const ledgerPath = base + '/vault-bridge-ledger.private.json';
 let ledger = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath, 'utf8')) : { allocations: {}, sends: {} };
 class BridgeError extends Error {}
+class PrebroadcastError extends BridgeError {
+  constructor(message) { super(message); this.data = { stage: 'prebroadcast', retryable: true }; }
+}
 function persistLedger(next) {
   const temporary = ledgerPath + '.tmp';
   const fd = fs.openSync(temporary, 'w', 0o600);
@@ -75,7 +78,7 @@ async function cycle() {
 const readonlyMethods = {
   wallet_status: async () => publicStatus(),
   wallet_balance: async () => parsed(await native.get_balance()),
-  wallet_transfers: async () => parsed(await native.get_value_transfers()),
+  wallet_transfers: async () => ({ value_transfers: await valueTransfers() }),
   wallet_addresses: async () => parsed(await native.get_unified_addresses()),
   wallet_parse_address: async params => {
     if (!Array.isArray(params) || params.length !== 1 || typeof params[0] !== 'string' || params[0].length > 512) throw new Error('Invalid address parameters.');
@@ -89,13 +92,15 @@ function inputObject(params) {
 function assertAmount(value) {
   if (!Number.isSafeInteger(value) || value < 1 || value > 2100000000000000) throw new BridgeError('Invalid integer zatoshi amount.');
 }
-async function orchardOnly(address) {
-  if (typeof address !== 'string' || address.length > 512 || !address.startsWith('utest1')) throw new BridgeError('Use an Orchard-only testnet Unified Address.');
+async function orchardRecipient(address) {
+  if (typeof address !== 'string' || address.length > 512 || !address.startsWith('utest1')) throw new BridgeError('Use a testnet Unified Address with an Orchard receiver.');
   const receiver = parsed(await native.parse_address(address));
   if (receiver.status !== 'success' || receiver.chain_name !== 'test' || receiver.address_kind !== 'unified' ||
-      receiver.only_orchard_ua !== address || !Array.isArray(receiver.receivers_available) ||
-      receiver.receivers_available.length !== 1 || receiver.receivers_available[0] !== 'orchard') throw new BridgeError('The native wallet did not verify an Orchard-only testnet receiver.');
-  return address;
+      typeof receiver.only_orchard_ua !== 'string' || !receiver.only_orchard_ua.startsWith('utest1') ||
+      !Array.isArray(receiver.receivers_available) || !receiver.receivers_available.includes('orchard')) throw new BridgeError('The native wallet did not verify a testnet Orchard receiver.');
+  // Decode the user's UA, then send to its Orchard receiver alone. Sapling and
+  // transparent receivers in an ordinary UA cannot become fallback recipients.
+  return receiver.only_orchard_ua;
 }
 async function syncedHeight() {
   const progress = parsed(await native.status_sync());
@@ -115,21 +120,39 @@ function balanceValue(value) {
 async function prepare(input) {
   assertAmount(input.amountZatoshis);
   await syncedHeight();
-  const address = await orchardOnly(input.address);
+  const shieldedAddress = await orchardRecipient(input.address);
   const current = parsed(await native.get_balance());
   if (balanceValue(current.total_transparent_balance) !== 0 || balanceValue(current.total_sapling_balance) !== 0) throw new BridgeError('This demo operator wallet requires only Orchard or Ironwood funds before payout.');
   const spendable = balanceValue(current.confirmed_ironwood_balance) + balanceValue(current.confirmed_orchard_balance);
   if (!Number.isSafeInteger(spendable) || spendable <= input.amountZatoshis) throw new BridgeError('Fund the operator shielded testnet wallet for the payout plus wallet-calculated fees.');
-  return { address, spendableZatoshis: spendable };
+  return { address: input.address, shieldedAddress, spendableZatoshis: spendable };
 }
-const shieldedPools = pools => Array.isArray(pools) && pools.length > 0 && pools.every(pool => pool === 'Orchard' || pool === 'Ironwood');
+const shieldedPools = pools => Array.isArray(pools) && pools.length > 0 && pools.every(pool => pool === 'orchard' || pool === 'ironwood');
+function normalizePools(pools) {
+  return Array.isArray(pools) ? pools.map(pool => typeof pool === 'string' ? pool.toLowerCase() : pool) : pools;
+}
 async function valueTransfers() {
   const result = parsed(await native.get_value_transfers());
   const transfers = Array.isArray(result) ? result : result?.value_transfers;
   if (!Array.isArray(transfers)) throw new BridgeError('Unsupported native wallet transaction response.');
-  return transfers;
+  return transfers.map(transfer => ({ ...transfer,
+    pools_sent_from: normalizePools(transfer.pools_sent_from), pools_received: normalizePools(transfer.pools_received) }));
 }
 function memoMatches(transfer, memo) { return Array.isArray(transfer.memos) && transfer.memos.length === 1 && transfer.memos[0] === memo; }
+function sendKey(memo) {
+  if (typeof memo !== 'string' || !/^zcashed:v1:payout:[0-9a-f-]{36}$/.test(memo)) throw new PrebroadcastError('Invalid opaque payout memo.');
+  return crypto.createHash('sha256').update(memo).digest('hex');
+}
+function releaseSendReservation(key) {
+  const sends = Object.fromEntries(Object.entries(ledger.sends).filter(([entryKey]) => entryKey !== key));
+  persistLedger({ ...ledger, sends });
+}
+async function cancelBeforeBroadcast(key, message, proposalDispatched, confirmDispatched) {
+  if (confirmDispatched) throw new BridgeError('Payout broadcast is uncertain. Reconcile the wallet; do not resend.');
+  if (proposalDispatched && await native.clear_proposal() !== 'OK') throw new BridgeError('The wallet could not confirm cancellation of its stored proposal. Reconcile it; do not resend.');
+  releaseSendReservation(key);
+  throw new PrebroadcastError(message);
+}
 const vaultMethods = {
   vault_create_address: params => serializeWrite(async () => {
     const input = inputObject(params);
@@ -139,7 +162,7 @@ const vaultMethods = {
     if (Object.hasOwn(ledger.allocations, key)) return ledger.allocations[key];
     const created = parsed(await native.create_new_unified_address('o'));
     if (created.account !== 0 || created.has_orchard !== true || created.has_sapling !== false || created.has_transparent !== false || !Number.isSafeInteger(created.address_index)) throw new BridgeError('Unsupported native address derivation.');
-    const address = await orchardOnly(created.encoded_address);
+    const address = await orchardRecipient(created.encoded_address);
     await native.save_wallet_file();
     fs.chmodSync(publicWallet.walletPath, 0o600);
     const allocation = { address, accountId: '0', allocationKey: input.allocationKey, addressIndex: created.address_index, startHeight };
@@ -150,7 +173,7 @@ const vaultMethods = {
     const input = inputObject(params);
     assertAmount(input.amountZatoshis);
     const height = await syncedHeight();
-    await orchardOnly(input.address);
+    await orchardRecipient(input.address);
     if (typeof input.reference !== 'string' || !/^zcashed:v1:deposit:[0-9a-f-]{36}$/.test(input.reference) || !Number.isSafeInteger(input.startHeight) || input.startHeight < 1 || input.startHeight > height) throw new BridgeError('Invalid vault receipt reference or start height.');
     if (!Object.values(ledger.allocations).some(allocation => allocation.address === input.address && allocation.startHeight === input.startHeight)) throw new BridgeError('The funding address is not a persisted vault allocation.');
     const transfers = await valueTransfers();
@@ -168,36 +191,57 @@ const vaultMethods = {
   vault_prepare_payout: params => prepare(inputObject(params)),
   vault_send_payout: params => serializeWrite(async () => {
     const input = inputObject(params);
-    if (typeof input.memo !== 'string' || !/^zcashed:v1:payout:[0-9a-f-]{36}$/.test(input.memo)) throw new BridgeError('Invalid opaque payout memo.');
-    const key = crypto.createHash('sha256').update(input.memo).digest('hex');
+    const key = sendKey(input.memo);
     if (Object.hasOwn(ledger.sends, key)) throw new BridgeError('This payout already has a permanent reservation. Reconcile it; do not resend.');
-    const prepared = await prepare(input);
-    const reservation = { address: prepared.address, amountZatoshis: input.amountZatoshis, memo: input.memo, state: 'reserved', createdAt: new Date().toISOString() };
-    persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: reservation } });
+    let prepared;
+    try { prepared = await prepare(input); }
+    catch (error) { throw new PrebroadcastError(error instanceof BridgeError ? error.message : 'The wallet preflight failed before any payout proposal or broadcast was dispatched.'); }
+    const reservation = { address: prepared.address, shieldedAddress: prepared.shieldedAddress, amountZatoshis: input.amountZatoshis, memo: input.memo, state: 'reserved', createdAt: new Date().toISOString() };
+    try { persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: reservation } }); }
+    catch { return cancelBeforeBroadcast(key, 'The payout could not be reserved before wallet dispatch.', false, false); }
+    let proposalDispatched = false;
+    let confirmDispatched = false;
     try {
-      const proposal = parsed(await native.send(JSON.stringify([{ address: prepared.address, amount: input.amountZatoshis, memo: input.memo }])));
+      // native.send creates a stored proposal only. native.confirm is the only
+      // signing/broadcast dispatch here; cancellation before it proves no send.
+      proposalDispatched = true;
+      const proposal = parsed(await native.send(JSON.stringify([{ address: prepared.shieldedAddress, amount: input.amountZatoshis, memo: input.memo }])));
       if (proposal?.error || !Number.isSafeInteger(proposal?.fee) || proposal.fee < 0 || prepared.spendableZatoshis < input.amountZatoshis + proposal.fee) {
-        await native.clear_proposal();
-        throw new BridgeError('The wallet could not propose the full payout with shielded funds and fees.');
+        return await cancelBeforeBroadcast(key, 'The wallet rejected the payout proposal before broadcast; no payout was sent.', proposalDispatched, confirmDispatched);
       }
-      persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, state: 'broadcasting', feeZatoshis: proposal.fee } } });
+      try { persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, state: 'broadcasting', feeZatoshis: proposal.fee } } }); }
+      catch { return await cancelBeforeBroadcast(key, 'The payout reservation could not be made durable before broadcast; no payout was sent.', proposalDispatched, confirmDispatched); }
+      confirmDispatched = true;
       const sent = parsed(await native.confirm());
       await native.save_wallet_file();
       if (sent?.error || !Array.isArray(sent?.txids) || sent.txids.length !== 1 || !/^[0-9a-f]{64}$/.test(sent.txids[0])) throw new BridgeError('Payout broadcast is uncertain. The bridge will not resend; reconcile the native wallet.');
       persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...ledger.sends[key], state: 'broadcast', txid: sent.txids[0] } } });
       return { txid: sent.txids[0], broadcast: true };
     } catch (error) {
+      if (error instanceof PrebroadcastError) throw error;
       persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...ledger.sends[key], state: 'unknown' } } });
       throw error instanceof BridgeError ? error : new BridgeError('Payout broadcast is uncertain. The bridge will not resend; reconcile the native wallet.');
     }
+  }),
+  vault_release_prebroadcast: params => serializeWrite(async () => {
+    const input = inputObject(params);
+    const key = sendKey(input.memo);
+    // A dispatched send always has a durable memo reservation first. Absence
+    // proves this memo never reached dispatch, or was cancelled with proof.
+    // Existing reserved/broadcasting/unknown records are never auto-released.
+    if (Object.hasOwn(ledger.sends, key)) throw new BridgeError('This payout has a wallet reservation; automatic release is unsafe.');
+    await syncedHeight();
+    const transfers = await valueTransfers();
+    if (transfers.some(transfer => Array.isArray(transfer.memos) && transfer.memos.includes(input.memo))) throw new BridgeError('The wallet already has a transaction carrying this payout memo; automatic release is unsafe.');
+    return { released: true, stage: 'prebroadcast', retryable: true };
   }),
   vault_inspect_payout: async params => {
     const input = inputObject(params);
     assertAmount(input.amountZatoshis);
     const height = await syncedHeight();
-    await orchardOnly(input.address);
+    const shieldedAddress = await orchardRecipient(input.address);
     if (typeof input.txid !== 'string' || !/^[0-9a-f]{64}$/.test(input.txid) || typeof input.memo !== 'string') throw new BridgeError('Invalid payout receipt request.');
-    const transfer = (await valueTransfers()).find(item => item.txid === input.txid && item.kind === 'sent' && item.recipient_address === input.address && item.value === input.amountZatoshis && memoMatches(item, input.memo) && shieldedPools(item.pools_received) && shieldedPools(item.pools_sent_from));
+    const transfer = (await valueTransfers()).find(item => item.txid === input.txid && item.kind === 'sent' && item.recipient_address === shieldedAddress && item.value === input.amountZatoshis && memoMatches(item, input.memo) && shieldedPools(item.pools_received) && shieldedPools(item.pools_sent_from));
     if (!transfer) throw new BridgeError('The native wallet has not verified the reserved payout recipient, amount, memo and shielded pools.');
     const confirmed = transfer.status === 'confirmed' && Number.isSafeInteger(transfer.blockheight) && transfer.blockheight > 0 && transfer.blockheight <= height;
     return { confirmed, confirmations: confirmed ? height - transfer.blockheight + 1 : 0 };
@@ -233,7 +277,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (!Object.hasOwn(methods, request.method) || !handler) return reply(res, 200, { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Unsupported bridge method; this bridge is not Zallet.' } });
     const result = await handler(request.params);
     return reply(res, 200, { jsonrpc: '2.0', id: request.id, result });
-  } catch (error) { return reply(res, 200, { jsonrpc: '2.0', id: request?.id ?? null, error: { code: -32000, message: error instanceof BridgeError ? error.message : 'Wallet request failed; inspect private operator status.' } }); }
+  } catch (error) { return reply(res, 200, { jsonrpc: '2.0', id: request?.id ?? null, error: { code: -32000, message: error instanceof BridgeError ? error.message : 'Wallet request failed; inspect private operator status.', ...(error instanceof PrebroadcastError ? { data: error.data } : {}) } }); }
 });
 httpServer.requestTimeout = 10000;
 httpServer.headersTimeout = 5000;

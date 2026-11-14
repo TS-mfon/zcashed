@@ -5,6 +5,7 @@ import { getJob, updateJob } from './store'
 import type { Job } from './types'
 import { parseShieldedAddress } from './zcash'
 import { deriveVaultAddress, inspectPayout, prepareShieldedPayout, sendShieldedPayout, verifyVaultDeposit, zalletConfiguration, type VaultReceipt } from './zallet'
+import { ZingoPrebroadcastError, releaseZingoPrebroadcast } from './zingo'
 
 // Private operational records are deliberately separate from publicly listed jobs.
 // These records must never be sent to GenLayer or returned by the jobs API.
@@ -16,7 +17,7 @@ type Deposit = { _id: string; kind: 'deposit'; jobId: string; accountId: string;
   receiptId: string; receipt: VaultReceipt; confirmedAt: string }
 type Claim = { _id: string; kind: 'claim'; jobId: string; accountId: string; claimantId: string; purpose: ReleasePurpose; payoutAddress: string;
   amountZatoshis: number; memo: string; state: ClaimState; txid?: string; broadcast?: boolean; confirmations?: number;
-  createdAt: string; updatedAt: string }
+  retryStatus?: Job['status']; createdAt: string; updatedAt: string }
 
 export interface PrivateVaultOperation { purpose: ReleasePurpose; state: ClaimState; txid?: string; confirmations: number; message: string }
 export class VaultError extends Error {
@@ -134,12 +135,32 @@ export async function getPrivateVaultOperation(jobId: string): Promise<PrivateVa
   return operation ? publicOperation(operation) : null
 }
 
-async function reconcile(db: Db, job: Job, operation: Claim): Promise<{ job: Job; operation: PrivateVaultOperation }> {
+async function clearPrebroadcast(db: Db, job: Job, operation: Claim): Promise<{job: Job; operation: null}> {
+  await releaseZingoPrebroadcast(operation.memo)
+  const refund = operation.purpose === 'client_refund'
+  const retryStatus = operation.retryStatus ?? (refund ? job.submissions.at(-1)?.status === 'rejected' ? 'rejected' : 'cancelled' : 'approved')
+  const allowed = refund ? ['refunding', 'rejected', 'cancelled'] : ['claiming', 'approved']
+  if (!allowed.includes(job.status)) throw new VaultError(409, 'The job cannot release this payout reservation.')
+  const restored = await updateJob(job.id, {status: retryStatus}, {status: job.status, workerAddress: job.workerAddress, clientAddress: job.clientAddress})
+  if (!restored) throw new VaultError(409, 'The job changed during payout recovery.')
+  await write(async () => {
+    const result = await claims(db).deleteOne({_id: operation._id, kind: 'claim', memo: operation.memo,
+      state: {$in: ['reserved', 'broadcasting', 'unknown']}, txid: {$exists: false}})
+    return {acknowledged: result.acknowledged, matchedCount: result.deletedCount}
+  })
+  return {job: restored, operation: null}
+}
+
+async function reconcile(db: Db, job: Job, operation: Claim): Promise<{ job: Job; operation: PrivateVaultOperation | null }> {
   const refund = operation.purpose === 'client_refund'
   const claimant = refund ? job.clientAddress : job.workerAddress
   const pendingStatus = refund ? 'refunding' : 'claiming'
   const finalStatus = refund ? 'refunded' : 'completed'
   if (operation.claimantId !== claimant || operation.amountZatoshis !== job.budgetZatoshis) throw new VaultError(409, 'The claim reservation does not match this job.')
+  if (!operation.txid && operation.state === 'unknown' && process.env.ZINGO_RPC_URL) {
+    try { return await clearPrebroadcast(db, job, operation) }
+    catch (error) { console.error('Payout recovery deferred:', error instanceof Error ? error.name : 'unknown error') }
+  }
   if (operation.txid) {
     const evidence = await inspectPayout({ txid: operation.txid, address: operation.payoutAddress,
       amountZatoshis: operation.amountZatoshis, memo: operation.memo })
@@ -219,7 +240,7 @@ async function releaseJobFunds(job: Job, payoutAddress: string | undefined, purp
   const now = new Date().toISOString()
   const intent: Claim = { _id: 'claim:' + job.id, kind: 'claim', jobId: job.id, accountId: allocation.accountId,
     claimantId: purpose === 'client_refund' ? job.clientAddress : job.workerAddress, purpose, payoutAddress: recipient, amountZatoshis: job.budgetZatoshis,
-    memo: 'zcashed:v1:payout:' + randomUUID(), state: 'reserved', createdAt: now, updatedAt: now }
+    memo: 'zcashed:v1:payout:' + randomUUID(), state: 'reserved', retryStatus: job.status, createdAt: now, updatedAt: now }
   try {
     const result = await claims(db).insertOne(intent)
     if (!result.acknowledged) throw new Error('Claim was not acknowledged')
@@ -239,7 +260,7 @@ async function releaseJobFunds(job: Job, payoutAddress: string | undefined, purp
   return broadcastRelease(db, claiming, intent)
 }
 
-async function broadcastRelease(db: Db, claiming: Job, intent: Claim): Promise<{ job: Job; operation: PrivateVaultOperation }> {
+async function broadcastRelease(db: Db, claiming: Job, intent: Claim): Promise<{ job: Job; operation: PrivateVaultOperation | null }> {
   await write(() => claims(db).updateOne({ _id: intent._id, state: 'reserved' }, { $set: { state: 'broadcasting', updatedAt: new Date().toISOString() } }))
   let outcome: { txid: string; broadcast: boolean } | undefined
   try {
@@ -247,7 +268,11 @@ async function broadcastRelease(db: Db, claiming: Job, intent: Claim): Promise<{
     const sent: Claim = { ...intent, ...outcome, state: outcome.broadcast ? 'broadcast' : 'unbroadcast', updatedAt: new Date().toISOString() }
     await saveClaim(db, sent)
     return { job: claiming, operation: publicOperation(sent) }
-  } catch {
+  } catch (error) {
+    if (error instanceof ZingoPrebroadcastError && !outcome) {
+      try { return await clearPrebroadcast(db, claiming, intent) }
+      catch (recoveryError) { console.error('Payout recovery deferred:', recoveryError instanceof Error ? recoveryError.name : 'unknown error') }
+    }
     const unknown: Claim = { ...intent, ...outcome, state: 'unknown', updatedAt: new Date().toISOString() }
     await saveClaim(db, unknown)
     return { job: claiming, operation: publicOperation(unknown) }
