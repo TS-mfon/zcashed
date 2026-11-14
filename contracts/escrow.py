@@ -27,7 +27,7 @@ class ZCashedEscrow(gl.Contract):
         title = _bounded_text(task_title, "Title", 1, 200)
         requirements = _bounded_text(task_description, "Public requirements", 20, 12000)
         rubric = _make_rubric(requirements)
-        self.owner = gl.message.sender_account
+        self.owner = gl.message.sender_address
         self.task_title = title
         self.task_description = requirements
         self.rubric_json = json.dumps(rubric, sort_keys=True)
@@ -55,7 +55,7 @@ class ZCashedEscrow(gl.Contract):
         }
 
     def _require_owner(self) -> None:
-        if gl.message.sender_account != self.owner:
+        if gl.message.sender_address != self.owner:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only the deployer can write")
 
     @gl.public.write
