@@ -144,6 +144,26 @@ export async function connectWallet(req: NextRequest, challengeToken: unknown, s
   return response
 }
 
+// Zucchini's ordinary connection grants address access, not a native-message
+// signature. Account authority therefore comes from this browser's signed,
+// server-issued capability cookie. An address never recovers another account.
+export function connectBrowserWallet(req: NextRequest, address: unknown): NextResponse {
+  assertSameOrigin(req)
+  rateLimit('browser-connect:' + (req.headers.get('x-forwarded-for')?.split(',')[0] || 'local'), 20)
+  if (typeof address !== 'string' || address.length > 1023) throw new ApiError(400, 'Connect your testnet Unified Address through Zucchini.')
+  let unified: string
+  try { unified = parseShieldedAddress(address, 'testnet').address }
+  catch { throw new ApiError(400, 'Switch Zucchini to Zcash testnet and reconnect.') }
+  if (!unified.startsWith('utest1')) throw new ApiError(400, 'Connect a testnet Unified Address.')
+  const existing = getSession(req)
+  const seconds = 30 * 24 * 60 * 60
+  const payload: Session = { v: 1, kind: 'session', id: existing?.id ?? 'user_' + randomBytes(32).toString('hex'),
+    walletAddress: unified, network: 'testnet', exp: Date.now() + seconds * 1000 }
+  const response = NextResponse.json({ address: payload.id, walletAddress: unified, network: 'testnet' })
+  response.cookies.set(SESSION_COOKIE, sign(payload), { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', path: '/', maxAge: seconds })
+  return response
+}
+
 export function apiErrorResponse(error: unknown): NextResponse {
   if (error instanceof ZingoError) return NextResponse.json({ error: error.message }, { status: error.status })
   if (error instanceof ApiError) return NextResponse.json({ error: error.message }, { status: error.status })

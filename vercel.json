@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "installCommand": "npm ci --registry=https://registry.npmjs.org",
+  "installCommand": "npm ci --no-audit --registry=https://registry.npmjs.org",
   "buildCommand": "bun run build"
 }

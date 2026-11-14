@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { apiErrorResponse, assertSameOrigin, connectWallet, getSession, SESSION_COOKIE } from '@/lib/auth'
+import { apiErrorResponse, assertSameOrigin, connectWallet, connectBrowserWallet, getSession, SESSION_COOKIE } from '@/lib/auth'
 
 export async function GET(req: NextRequest) {
   try {
@@ -11,6 +11,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
+    if (body?.mode === 'browser-wallet') return connectBrowserWallet(req, body.walletAddress)
     return await connectWallet(req, body.challengeToken, body.signature)
   } catch (error) { return apiErrorResponse(error) }
 }
