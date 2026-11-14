@@ -3,7 +3,7 @@
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 import { Profile } from '@/lib/types'
 import { ZcashNetwork, parseShieldedAddress } from '@/lib/zcash'
-import { BrowserWallet } from '@/lib/browser-wallet'
+import { BrowserWallet, requestZucchiniPayment } from '@/lib/browser-wallet'
 import WalletPicker from './WalletPicker'
 import { useRouter } from 'next/navigation'
 
@@ -33,6 +33,7 @@ interface WalletContextType extends WalletState {
   clearWallet: () => Promise<void>
   isConnected: boolean
   openWalletPicker: () => void
+  requestWalletPayment: (uri: string) => Promise<{ txid: string }>
   beginConnection: (walletAddress: string, unifiedAddress?: string) => Promise<WalletChallenge | null>
   verifyConnection: (challengeToken: string, signature: string) => Promise<WalletConnection | null>
   refreshProfile: () => Promise<void>
@@ -120,11 +121,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       const accounts = await wallet.connect()
       const account = accounts[0]
       if (!account) throw new Error('This wallet did not expose a testnet Unified Account with native message signing. Switch your wallet to testnet and try again.')
-      const challenge = await beginConnection(account.signingAddress, account.address)
-      if (!challenge) return
-      const signature = await wallet.sign(account, challenge.message)
-      const connection = await verifyConnection(challenge.challengeToken, signature)
-      if (!connection) return
+      const response = await fetch('/api/session', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'browser-wallet', walletAddress: account.address }),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error ?? 'The browser account session could not be created.')
+      const connection = readConnection(data)
+      if (!connection) throw new Error('The server did not establish your browser account session.')
+      const profileState = await resolveProfile(connection.address)
+      setState({ ...connection, ...profileState, isLoading: false })
       setPickerOpen(false)
       router.push('/onboarding')
     } catch (cause) {
@@ -196,6 +202,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     clearWallet,
     isConnected: !!state.address && !!state.walletAddress,
     openWalletPicker,
+    requestWalletPayment: requestZucchiniPayment,
     beginConnection,
     verifyConnection,
     refreshProfile,

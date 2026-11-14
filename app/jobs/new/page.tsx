@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useWallet } from '@/components/WalletContext'
 import { JOB_CATEGORIES, Job } from '@/lib/types'
@@ -11,6 +11,7 @@ export default function NewJobPage() {
   const router = useRouter()
   const { address, isConnected, role, isLoading } = useWallet()
 
+  const creationId = useRef<string | null>(null)
   const [form, setForm] = useState({
     title: '',
     description: '',
@@ -37,6 +38,7 @@ export default function NewJobPage() {
     try { budgetZatoshis = parseZecToZatoshis(form.budgetZec) }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Enter a valid ZEC budget.'); return }
 
+    if (!creationId.current) creationId.current = crypto.randomUUID()
     setError('')
     setLoading(true)
     try {
@@ -44,6 +46,7 @@ export default function NewJobPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          creationId: creationId.current,
           title: form.title.trim(),
           description: form.description.trim(),
           category: form.category,

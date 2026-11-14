@@ -1,93 +1,58 @@
 import { parseShieldedAddress } from './zcash'
 
-export interface BrowserWalletAccount {
-  address: string
-  signingAddress: string
-  network: 'testnet'
-  source: Record<string, unknown>
-}
+export interface BrowserWalletAccount { address: string; network: 'testnet' }
 export interface BrowserWallet {
   id: string
   name: string
   connect: () => Promise<BrowserWalletAccount[]>
-  sign: (account: BrowserWalletAccount, message: string) => Promise<string>
+}
+interface ZucchiniProvider {
+  request: (args: { method: string; params?: unknown }) => Promise<unknown>
+  connect?: (permissions: readonly string[]) => Promise<unknown>
 }
 type ObjectValue = Record<string, unknown>
 const object = (value: unknown): ObjectValue | null => value !== null && typeof value === 'object' ? value as ObjectValue : null
-const registry = new Map<string, BrowserWallet>()
-let listeners = new Set<(wallets: BrowserWallet[]) => void>()
-let listening = false
-
-function account(value: unknown): BrowserWalletAccount | null {
-  const data = object(value)
-  if (!data || typeof data.address !== 'string' || typeof data.signingAddress !== 'string' || !data.signingAddress.startsWith('tm')) return null
-  try {
-    const recipient = parseShieldedAddress(data.address, 'testnet')
-    if (!recipient.address.startsWith('utest1') || (data.network !== undefined && data.network !== 'testnet')) return null
-    return { address: recipient.address, signingAddress: data.signingAddress, network: 'testnet', source: data }
-  } catch { return null }
+function provider(): ZucchiniProvider | null {
+  if (typeof window === 'undefined') return null
+  const value = object((window as unknown as ObjectValue).zucchini)
+  return value && typeof value.request === 'function' ? value as unknown as ZucchiniProvider : null
 }
-function accounts(result: unknown): BrowserWalletAccount[] {
-  const values = Array.isArray(result) ? result : object(result)?.accounts
-  return Array.isArray(values) ? values.map(account).filter((value): value is BrowserWalletAccount => !!value) : []
+// Exact ordinary Wallet 0.5.2 ABI from the official SDK's src/zcash.ts:
+// https://github.com/zucchini-wallet/dapp-sdk/blob/main/src/zcash.ts
+async function permissions(wallet: ZucchiniProvider, requested: string[]): Promise<void> {
+  if (typeof wallet.connect !== 'function') throw new Error('Zucchini was detected, but this version does not expose its website connection interface. Enable website connections or update the wallet.')
+  const grant = object(await wallet.connect(requested))
+  if (grant?.connected !== true || !Array.isArray(grant.approvedPermissions) || requested.some((permission) => !grant.approvedPermissions!.includes(permission))) {
+    throw new Error('Approve the requested permissions in Zucchini to continue.')
+  }
 }
-function signature(result: unknown): string {
-  const value = Array.isArray(result) ? result[0] : result
-  const data = object(value)
-  const proof = typeof value === 'string' ? value : data?.signature
-  if (typeof proof === 'string' && /^[A-Za-z0-9+/]{87}=$/.test(proof)) return proof
-  if (proof instanceof Uint8Array && proof.length === 65) return btoa(String.fromCharCode(...proof))
-  throw new Error('This wallet did not return a native Zcash message-signing proof. It has not been connected.')
+async function testnet(wallet: ZucchiniProvider): Promise<void> {
+  const network = object(await wallet.request({ method: 'getNetwork' }))
+  if (network?.network !== 'test') throw new Error('Switch Zucchini to Zcash testnet. This app accepts testnet accounts only.')
 }
-function publish() { const wallets = [...registry.values()]; listeners.forEach((listener) => listener(wallets)) }
-
-// Wallet Standard defines discovery and account permission. zcash:signMessage is
-// an optional provider-advertised capability, not a universal Zcash wallet API.
-function registerStandard(...values: unknown[]) {
-  const ids: string[] = []
-  values.forEach((value) => {
-    const wallet = object(value), features = object(wallet?.features)
-    const connect = object(features?.['standard:connect']), sign = object(features?.['zcash:signMessage'])
-    if (!wallet || typeof wallet.name !== 'string' || typeof connect?.connect !== 'function' || typeof sign?.signMessage !== 'function') return
-    const id = 'standard:' + wallet.name
-    ids.push(id)
-    registry.set(id, { id, name: wallet.name,
-      connect: async () => accounts(await (connect.connect as (options: { silent: boolean }) => Promise<unknown>).call(connect, { silent: false })),
-      sign: async (selected, message) => signature(await (sign.signMessage as (input: unknown) => Promise<unknown>).call(sign, {
-        account: selected.source, message: new TextEncoder().encode(message), signingAddress: selected.signingAddress,
-      })),
-    })
-  })
-  publish()
-  return () => { ids.forEach((id) => registry.delete(id)); publish() }
-}
-function scanInjected() {
-  const injection = object((window as unknown as ObjectValue).zcash)
-  const providers = Array.isArray(injection?.providers) ? injection.providers : injection ? [injection] : []
-  providers.forEach((value, index) => {
-    const provider = object(value)
-    if (!provider || typeof provider.requestAccounts !== 'function' || typeof provider.signMessage !== 'function') return
-    const name = typeof provider.name === 'string' ? provider.name : 'Injected Zcash wallet'
-    const id = 'injected:' + name + ':' + index
-    registry.set(id, { id, name,
-      connect: async () => accounts(await (provider.requestAccounts as (input: unknown) => Promise<unknown>).call(provider, { network: 'testnet' })),
-      sign: async (selected, message) => signature(await (provider.signMessage as (input: unknown) => Promise<unknown>).call(provider, {
-        network: 'testnet', account: selected.source, address: selected.signingAddress, message,
-      })),
-    })
-  })
+async function connect(): Promise<BrowserWalletAccount[]> {
+  const wallet = provider()
+  if (!wallet) throw new Error('Enable Zucchini for this website, then refresh the page.')
+  await permissions(wallet, ['view_addresses'])
+  await testnet(wallet)
+  const addresses = object(await wallet.request({ method: 'getAddresses' }))
+  if (typeof addresses?.unified !== 'string') throw new Error('Zucchini did not return a Unified Account. Unlock your wallet and try again.')
+  const recipient = parseShieldedAddress(addresses.unified, 'testnet')
+  if (!recipient.address.startsWith('utest1')) throw new Error('Choose a testnet Unified Account in Zucchini.')
+  return [{ address: recipient.address, network: 'testnet' }]
 }
 export function watchBrowserWallets(listener: (wallets: BrowserWallet[]) => void): () => void {
-  if (typeof window === 'undefined') return () => undefined
-  listeners = new Set([...listeners, listener])
-  if (!listening) {
-    window.addEventListener('wallet-standard:register-wallet', ((event: CustomEvent) => {
-      if (typeof event.detail === 'function') event.detail({ register: registerStandard })
-    }) as EventListener)
-    listening = true
-  }
-  scanInjected()
-  window.dispatchEvent(new CustomEvent('wallet-standard:app-ready', { detail: { register: registerStandard } }))
-  publish()
-  return () => { listeners = new Set([...listeners].filter((value) => value !== listener)) }
+  listener(provider() ? [{ id: 'zucchini', name: 'Zucchini', connect }] : [])
+  return () => undefined
+}
+export async function requestZucchiniPayment(uri: string): Promise<{ txid: string }> {
+  const wallet = provider()
+  if (!wallet) throw new Error('Enable Zucchini for this website and check wallet Activity before trying a payment.')
+  if (typeof uri !== 'string' || !uri.startsWith('zcash:utest1') || uri.length > 16384) throw new Error('A valid testnet ZIP 321 payment request is required.')
+  await permissions(wallet, ['view_addresses', 'send_transaction'])
+  await testnet(wallet)
+  // This call is made once. A returned txid is submission evidence, never confirmation.
+  const result = await wallet.request({ method: 'zcash_requestPayment', params: { uri } })
+  if (typeof result !== 'string' || !/^[a-f0-9]{64}$/i.test(result)) throw new Error('The payment response is uncertain. Check Zucchini Activity and the confirmed deposit before trying again.')
+  return { txid: result }
 }

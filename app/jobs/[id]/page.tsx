@@ -7,7 +7,7 @@ import VaultPanel from '@/components/VaultPanel'
 import { StatusBadge } from '@/components/StatusBadge'
 import { Job, Application } from '@/lib/types'
 import { formatZatoshis } from '@/lib/zcash'
-import { formatZec, timeAgo, categoryIcon, shortenAddress } from '@/lib/utils'
+import { timeAgo, categoryIcon, shortenAddress } from '@/lib/utils'
 import {
   Clock, User, CheckCircle, XCircle, Loader2, Brain, AlertCircle,
   RefreshCw, ArrowLeft, ExternalLink, Send, Users, Award,
@@ -37,7 +37,6 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
   const [submissionText, setSubmissionText] = useState<string | null>(null)
   const [submissionUrl, setSubmissionUrl] = useState<string | null>(null)
   const [coverLetter, setCoverLetter] = useState('')
-  const [proposedPrice, setProposedPrice] = useState('')
   const latestSub = (job?.submissions ?? []).slice().sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0]
   const deliveredText = submissionText ?? latestSub?.notes ?? ''
   const deliveredUrl = submissionUrl ?? latestSub?.submissionUrl ?? ''
@@ -84,11 +83,11 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     try {
       const res = await fetch(`/api/jobs/${id}/apply`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ applicantAddress: address, coverLetter, proposedPrice }),
+        body: JSON.stringify({ applicantAddress: address, coverLetter }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error)
-      setCoverLetter(''); setProposedPrice('')
+      setCoverLetter('')
       await loadJob()
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'The request failed.') } finally { setBusy(false) }
   }
@@ -234,10 +233,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
               <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Cover letter</label>
               <textarea value={coverLetter} onChange={(e) => setCoverLetter(e.target.value)} placeholder="Why are you the right fit? Share relevant experience…" style={{ width: '100%', padding: '12px 14px', fontSize: 14, minHeight: 110, resize: 'vertical' }} required />
             </div>
-            <div>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 7, color: 'var(--muted-2)' }}>Your price (ZEC) — optional</label>
-              <input type="number" step="0.0001" value={proposedPrice} onChange={(e) => setProposedPrice(e.target.value)} placeholder={`Default: ${job.budgetZec}`} style={{ width: '100%', padding: '12px 14px', fontSize: 14 }} />
-            </div>
+            <p style={{ fontSize: 13, color: 'var(--muted-2)' }}>Fixed job budget: <strong>{budgetLabel}</strong>. Applying accepts this budget.</p>
             <button type="submit" disabled={busy} className="btn btn-primary" style={{ padding: 14, fontSize: 15 }}>
               {busy ? <Loader2 size={16} className="spin" /> : null} {busy ? 'Submitting…' : 'Submit Application'}
             </button>
@@ -269,7 +265,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
                       <div style={{ fontSize: 15, fontWeight: 700 }}>{a.applicantName || 'Anonymous Freelancer'}</div>
                       <code style={{ fontSize: 11, color: 'var(--muted)' }}>{shortenAddress(a.applicantAddress, 8)}</code>
                     </div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--primary-dark)', fontFamily: 'var(--font-geist-mono)' }}>{formatZec(a.proposedPrice)}</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: 'var(--primary-dark)', fontFamily: 'var(--font-geist-mono)' }}>{budgetLabel}</div>
                   </div>
                   {a.coverLetter && <p style={{ fontSize: 13.5, color: 'var(--muted-2)', lineHeight: 1.6, marginBottom: 12, whiteSpace: 'pre-wrap' }}>{a.coverLetter}</p>}
                   <button onClick={() => handleAssign(a.id)} disabled={busy} className="btn btn-primary" style={{ fontSize: 13 }}>
