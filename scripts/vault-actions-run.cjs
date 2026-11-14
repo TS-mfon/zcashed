@@ -86,10 +86,10 @@ async function updateProduction(endpoint) {
   const existing = environments.envs.find(item => item.key === 'ZINGO_RPC_URL' && item.target?.includes('production'));
   if (!existing) throw new Error('Production vault environment configuration is missing.');
   await vercel('PATCH', `/v9/projects/${project}/env/${existing.id}`, { value: endpoint });
-  const deployments = await vercel('GET', `/v6/deployments?projectId=${project}&target=production&state=READY&limit=1`);
-  const current = deployments.deployments?.[0];
-  if (!current) throw new Error('A ready production deployment is required.');
-  const deployment = await vercel('POST', '/v13/deployments', { name: 'zcashed', project, deploymentId: current.uid, target: 'production' });
+  const repoId = Number(process.env.VERCEL_REPOSITORY_ID);
+  if (!Number.isSafeInteger(repoId) || repoId <= 0) throw new Error('The deployment repository is not configured.');
+  const deployment = await vercel('POST', '/v13/deployments', { name: 'zcashed', project, target: 'production',
+    gitSource: { type: 'github', repoId, ref: 'master' } });
   console.log(`Production deployment: https://${deployment.url}`);
   for (let attempt = 0; attempt < 120 && !stopping; attempt++) {
     await delay(10000);

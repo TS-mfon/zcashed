@@ -40,5 +40,6 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: prj_yRw8afyEUhCWLqgkoQFPhk8LzEby
           VERCEL_TEAM_ID: team_B7dvHnmHyByeFo4TYAaVOheF
+          VERCEL_REPOSITORY_ID: ${{ github.repository_id }}
           VAULT_DEMO_MINUTES: ${{ inputs.minutes }}
         run: node scripts/vault-actions-run.cjs
