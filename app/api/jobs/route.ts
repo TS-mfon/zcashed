@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getAllJobs, createJob, getJobsByClient, getJobsByWorker } from '@/lib/store'
-import { generateId } from '@/lib/utils'
+import { getAllJobs, getJobsByClient, getJobsByWorker } from '@/lib/store'
 import { ApiError, apiErrorResponse, requireActor } from '@/lib/auth'
-import { deployEscrowContract } from '@/lib/genlayer'
-import { createJobVault } from '@/lib/vault'
+import { createJobFromIntent, creationKey } from '@/lib/job-creation'
 import { JOB_CATEGORIES, type Job } from '@/lib/types'
 
 export const maxDuration = 180
@@ -30,27 +28,8 @@ export async function POST(req: NextRequest) {
     if (body.clientAddress !== undefined && typeof body.clientAddress !== 'string') throw new ApiError(400, 'Invalid client identity')
     const clientAddress = requireActor(req, body.clientAddress)
     const offer = jobInput(body)
-    const id = generateId()
-    let vault: Awaited<ReturnType<typeof createJobVault>>
-    try { vault = await createJobVault(id) }
-    catch (error) {
-      console.error('Job vault creation failed:', error)
-      throw new ApiError(503, 'Testnet vault creation failed: ' + (error instanceof Error ? error.message : 'Wallet unavailable'))
-    }
-    let genlayerContractAddress: string
-    try {
-      genlayerContractAddress = await deployEscrowContract({ taskTitle: offer.title, taskDescription: offer.description })
-    } catch (error) {
-      console.error('GenLayer deployment failed:', error)
-      throw new ApiError(503, 'GenLayer deployment failed: ' + (error instanceof Error ? error.message : 'Provider unavailable'))
-    }
-    const now = new Date().toISOString()
-    const job: Job = {
-      ...offer, id, clientAddress, workerAddress: '', status: 'funding_required',
-      vaultAddress: vault.address, vaultReference: vault.reference, vaultNetwork: vault.network, fundedAt: null, fundedZatoshis: 0,
-      genlayerContractAddress, createdAt: now, updatedAt: now, submissions: [], applications: [],
-    }
-    await createJob(job)
+    const key = creationKey(body.creationId, req.headers.get('idempotency-key'))
+    const job = await createJobFromIntent(clientAddress, key, offer)
     return NextResponse.json({ job }, { status: 201 })
   } catch (error) {
     return apiErrorResponse(error)

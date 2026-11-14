@@ -47,12 +47,12 @@ function readLocalJournal(): OperationJournal {
 
 function saveLocalJournal(journal: OperationJournal): void {
   const file = journalFile()
-  journalMemory = { ...journalMemory, [file]: journal }
   const temporary = file + '.' + randomUUID() + '.tmp'
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(temporary, JSON.stringify(journal), { mode: 0o600, flag: 'wx' })
     fs.renameSync(temporary, file)
+    journalMemory = { ...journalMemory, [file]: journal }
   } catch { throw new Error('Could not persist the local GenLayer recovery journal; retry this operation') }
   finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary) }
 }
@@ -119,6 +119,21 @@ export async function removeFailedOperation(key: string): Promise<void> {
   }
   const result = await database.collection<OperationDocument>('genlayer_operations', durableOptions).deleteOne({ _id: key })
   if (!result.acknowledged) throw new Error('Failed GenLayer operation cleanup was not acknowledged')
+}
+
+// Only the owner holding proof that signing never completed may release this reservation.
+export async function releaseUndispatchedOperation(key: string, dispatchToken: string): Promise<void> {
+  const database = await getMongoDatabase()
+  if (!database) {
+    const journal = readLocalJournal()
+    const entry = journal[key]
+    if (!entry || entry.dispatchToken !== dispatchToken || entry.hash) throw new Error('GenLayer dispatch reservation cannot be safely released')
+    saveLocalJournal(Object.fromEntries(Object.entries(journal).filter(([id]) => id !== key)))
+    return
+  }
+  const result = await database.collection<OperationDocument>('genlayer_operations', durableOptions)
+    .deleteOne({ _id: key, dispatchToken, hash: { $exists: false } })
+  if (!result.acknowledged || result.deletedCount !== 1) throw new Error('GenLayer pre-dispatch reservation release was not acknowledged; retry the original operation')
 }
 
 export async function acquireJobLease(jobId: string, durationMs = 300_000): Promise<JobLease> {

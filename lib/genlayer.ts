@@ -12,7 +12,7 @@ import {
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { acquireJobLease, releaseJobLease, readOperationJournal, reserveOperation, attachOperationHash, patchOperation, removeFailedOperation, GenLayerBusyError } from './genlayer-operations'
+import { acquireJobLease, releaseJobLease, readOperationJournal, reserveOperation, attachOperationHash, patchOperation, removeFailedOperation, releaseUndispatchedOperation, GenLayerBusyError } from './genlayer-operations'
 export { GenLayerBusyError } from './genlayer-operations'
 
 export type CriterionDecision = {
@@ -43,7 +43,8 @@ async function resumeOperation(client: ReturnType<typeof getClient>, address: st
   let hash = reservation.record.hash
   if (!hash) {
     if (!reservation.isNew) throw new GenLayerBusyError('A previous GenLayer transaction has an unknown dispatch outcome. Operator reconciliation is required before retrying.')
-    const dispatched = await client.writeContract({ address: contractAddress(address), functionName: method, args, value: 0n, leaderOnly: false })
+    const dispatched = await dispatchReserved(client, key, reservation.record.dispatchToken!, () =>
+      client.writeContract({ address: contractAddress(address), functionName: method, args, value: 0n, leaderOnly: false }))
     if (typeof dispatched !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(dispatched)) throw new Error('GenLayer returned an invalid transaction hash')
     await attachOperationHash(key, reservation.record.dispatchToken!, dispatched)
     hash = dispatched
@@ -96,7 +97,27 @@ function getPrivateKey(): `0x${string}` {
 }
 
 function getClient() {
-  return createClient({ chain: studionet, account: createAccount(getPrivateKey()) })
+  const account = createAccount(getPrivateKey())
+  let signed = false
+  const signTransaction = (async (...parameters: Parameters<typeof account.signTransaction>) => {
+    if (signed) throw new Error('Automatic GenLayer resend is blocked; operator reconciliation is required')
+    const serialized = await account.signTransaction(...parameters)
+    signed = true
+    return serialized
+  }) as typeof account.signTransaction
+  // genlayer-js@1.1.8 dispatches local-account writes only after signing. Marking
+  // at signing completion is conservative: every later failure remains unknown.
+  const client = createClient({ chain: studionet, account: { ...account, signTransaction } })
+  return { ...client, dispatchMayHaveStarted: () => signed, dispatchSigner: account.address.toLowerCase() }
+}
+
+async function dispatchReserved<T>(client: ReturnType<typeof getClient>, key: string, token: string, dispatch: () => Promise<T>): Promise<T> {
+  // All jobs share a deployer. Serialize nonce lookup and dispatch across jobs too.
+  try { return await withJobOperation('genlayer-signer:' + client.dispatchSigner, dispatch) }
+  catch (error) {
+    if (!client.dispatchMayHaveStarted()) await releaseUndispatchedOperation(key, token)
+    throw error
+  }
 }
 
 function contractAddress(value: string): `0x${string}` {
@@ -153,14 +174,27 @@ function executionSucceeded(receipt: GenLayerTransaction): boolean {
 export async function deployEscrowContract(params: {
   taskTitle: string
   taskDescription: string
+  creationScope?: string
+  onTransactionHash?: (hash: string) => Promise<void>
 }): Promise<string> {
+  if (!params.creationScope || !/^[0-9a-f]{64}$/.test(params.creationScope)) throw new Error('A durable job creation scope is required before deploying GenLayer')
   const client = getClient()
-  const code = fs.readFileSync(path.join(process.cwd(), 'contracts', 'escrow.py'), 'utf8')
-  const hash = await client.deployContract({
-    code,
-    args: [params.taskTitle, params.taskDescription],
-    leaderOnly: false,
-  })
+  const address = '0x0000000000000000000000000000000000000000'
+  // Scope, rather than current source code, identifies an existing deploy across releases.
+  const key = operationKey(address, 'deploy_escrow', [], params.creationScope)
+  const reservation = await reserveOperation(key, address)
+  let hash = reservation.record.hash
+  if (!hash) {
+    if (!reservation.isNew) throw new GenLayerBusyError('The original deployment has an unknown dispatch outcome. Operator reconciliation is required before retrying.')
+    const dispatched = await dispatchReserved(client, key, reservation.record.dispatchToken!, async () => {
+      const code = fs.readFileSync(path.join(process.cwd(), 'contracts', 'escrow.py'), 'utf8')
+      return client.deployContract({ code, args: [params.taskTitle, params.taskDescription], leaderOnly: false })
+    })
+    // Persist before polling. A timeout or lost response must never cause another deploy.
+    await attachOperationHash(key, reservation.record.dispatchToken!, dispatched)
+    hash = dispatched
+  }
+  await params.onTransactionHash?.(hash)
   const receipt = await successfulFinalization(client, hash)
   const deployed = receipt.data?.contract_address
   if (typeof deployed !== 'string') throw new Error('Successful GenLayer receipt is missing the deployed contract address')
