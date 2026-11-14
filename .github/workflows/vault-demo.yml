@@ -1,0 +1,44 @@
+name: Testnet vault demo
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Runtime in minutes (15–300)
+        required: true
+        default: '180'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zcashed-funded-testnet-vault
+  cancel-in-progress: false
+
+jobs:
+  vault:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.11.1'
+      - name: Install runtime dependencies
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+      - name: Install pinned wallet and HTTPS tunnel
+        run: bash scripts/install-vault-actions.sh
+      - name: Run funded vault and update production
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          VAULT_STATE_KEY: ${{ secrets.VAULT_STATE_KEY }}
+          VAULT_RPC_CREDENTIALS: ${{ secrets.VAULT_RPC_CREDENTIALS }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: prj_yRw8afyEUhCWLqgkoQFPhk8LzEby
+          VERCEL_TEAM_ID: team_B7dvHnmHyByeFo4TYAaVOheF
+          VAULT_DEMO_MINUTES: ${{ inputs.minutes }}
+        run: node scripts/vault-actions-run.cjs

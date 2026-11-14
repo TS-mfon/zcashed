@@ -9,6 +9,13 @@ const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const actionsOwner = process.env.ZCASHED_ACTIONS_OWNER;
+const actionsGenerationValue = process.env.ZCASHED_ACTIONS_GENERATION;
+const actionsEnabled = actionsOwner !== undefined || actionsGenerationValue !== undefined;
+const actionsGeneration = Number(actionsGenerationValue);
+if (actionsEnabled && (typeof actionsOwner !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(actionsOwner) ||
+    !/^[1-9][0-9]*$/.test(actionsGenerationValue || '') || !Number.isSafeInteger(actionsGeneration))) throw new Error('A hosted operator requires a valid lease owner and generation.');
+const actionsState = actionsEnabled ? require('./vault-actions-state.cjs') : null;
 process.umask(0o077);
 const base = path.resolve(process.env.ZCASHED_OPERATOR_DIR || path.join(os.homedir(), '.local', 'share', 'zcashed-operator'));
 const addonPath = process.env.ZCASHED_ZINGO_ADDON || path.join(base, 'runtime', 'zingo-pc', 'opt', 'Zingo PC', 'resources', 'app.asar.unpacked', 'build', 'native.node');
@@ -30,6 +37,7 @@ let walletHeight = null;
 let chainHeight = null;
 let balance = null;
 let loopBusy = false;
+let shuttingDown = false;
 let writeQueue = Promise.resolve();
 const ledgerPath = base + '/vault-bridge-ledger.private.json';
 let ledger = fs.existsSync(ledgerPath) ? JSON.parse(fs.readFileSync(ledgerPath, 'utf8')) : { allocations: {}, sends: {} };
@@ -37,7 +45,7 @@ class BridgeError extends Error {}
 class PrebroadcastError extends BridgeError {
   constructor(message) { super(message); this.data = { stage: 'prebroadcast', retryable: true }; }
 }
-function persistLedger(next) {
+function persistLocalLedger(next) {
   const temporary = ledgerPath + '.tmp';
   const fd = fs.openSync(temporary, 'w', 0o600);
   try { fs.writeFileSync(fd, JSON.stringify(next)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -46,8 +54,43 @@ function persistLedger(next) {
   try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   ledger = next;
 }
+async function persistLedger(next) {
+  persistLocalLedger(next);
+  if (actionsState) await actionsState.saveLedger(actionsOwner, actionsGeneration, next);
+}
+async function assertSpendLease() {
+  if (!actionsState) return;
+  try { await actionsState.assertLease(actionsOwner, actionsGeneration); }
+  catch { throw new BridgeError('The hosted operator lease is unavailable or expired. Wallet spending is disabled.'); }
+}
+function loadedLedger(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !value.allocations || !value.sends ||
+      typeof value.allocations !== 'object' || Array.isArray(value.allocations) || typeof value.sends !== 'object' || Array.isArray(value.sends)) throw new Error('The hosted operator requires its durable shared allocation and payout ledger.');
+  return value;
+}
 const parsed = value => { try { return JSON.parse(value); } catch { return value; } };
 const serializeWrite = fn => { const task = writeQueue.then(fn); writeQueue = task.catch(() => {}); return task; };
+async function saveActionsCheckpoint() {
+  if (!actionsState) throw new BridgeError('Hosted wallet checkpoints are unavailable.');
+  await assertSpendLease();
+  const manifest = JSON.parse(fs.readFileSync(base + '/actions-snapshot.private.json', 'utf8'));
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new BridgeError('The hosted wallet snapshot manifest is invalid.');
+  await native.save_wallet_file();
+  const walletBase64 = fs.readFileSync(publicWallet.walletPath).toString('base64');
+  fs.chmodSync(publicWallet.walletPath, 0o600);
+  await actionsState.saveSnapshot(actionsOwner, actionsGeneration, { ...manifest, walletBase64 });
+}
+function checkpointReply(id, ok) {
+  if (typeof process.send === 'function' && process.connected) process.send({ type: 'checkpoint', id, ok }, () => {});
+}
+process.on('message', async message => {
+  if (!message || message.type !== 'checkpoint') return;
+  const id = message.id;
+  if ((typeof id !== 'string' || id.length < 1 || id.length > 160) && !Number.isSafeInteger(id)) return;
+  if (!actionsState || !running || shuttingDown) { checkpointReply(id, false); return; }
+  try { await serializeWrite(saveActionsCheckpoint); checkpointReply(id, true); }
+  catch { checkpointReply(id, false); }
+});
 function publicStatus() {
   return { runtime: publicWallet.runtime, network: 'testnet', account: 0, fundingAddress: publicWallet.fundingAddress,
     running, lightwalletd: server, walletHeight, chainHeight, syncProgress, balance, lastCycle, lastError,
@@ -56,7 +99,7 @@ function publicStatus() {
 }
 function saveStatus() { fs.writeFileSync(base + '/bridge-status.json', JSON.stringify(publicStatus(), null, 2), { mode: 0o600 }); }
 async function cycle() {
-  if (loopBusy) return;
+  if (loopBusy || shuttingDown) return;
   loopBusy = true;
   try {
     const report = parsed(await native.poll_sync());
@@ -69,8 +112,10 @@ async function cycle() {
     balance = parsed(await native.get_balance());
     lastCycle = new Date().toISOString();
     if (!report?.sync_failed) lastError = null;
-    await native.save_wallet_file();
-    fs.chmodSync(publicWallet.walletPath, 0o600);
+    await serializeWrite(async () => {
+      await native.save_wallet_file();
+      fs.chmodSync(publicWallet.walletPath, 0o600);
+    });
     saveStatus();
   } catch (error) { lastError = String(error.message || error); saveStatus(); }
   finally { loopBusy = false; }
@@ -118,6 +163,7 @@ function balanceValue(value) {
   return value;
 }
 async function prepare(input) {
+  await assertSpendLease();
   assertAmount(input.amountZatoshis);
   await syncedHeight();
   const shieldedAddress = await orchardRecipient(input.address);
@@ -143,30 +189,33 @@ function sendKey(memo) {
   if (typeof memo !== 'string' || !/^zcashed:v1:payout:[0-9a-f-]{36}$/.test(memo)) throw new PrebroadcastError('Invalid opaque payout memo.');
   return crypto.createHash('sha256').update(memo).digest('hex');
 }
-function releaseSendReservation(key) {
+async function releaseSendReservation(key) {
   const sends = Object.fromEntries(Object.entries(ledger.sends).filter(([entryKey]) => entryKey !== key));
-  persistLedger({ ...ledger, sends });
+  await persistLedger({ ...ledger, sends });
 }
 async function cancelBeforeBroadcast(key, message, proposalDispatched, confirmDispatched) {
   if (confirmDispatched) throw new BridgeError('Payout broadcast is uncertain. Reconcile the wallet; do not resend.');
   if (proposalDispatched && await native.clear_proposal() !== 'OK') throw new BridgeError('The wallet could not confirm cancellation of its stored proposal. Reconcile it; do not resend.');
-  releaseSendReservation(key);
+  await releaseSendReservation(key);
   throw new PrebroadcastError(message);
 }
 const vaultMethods = {
   vault_create_address: params => serializeWrite(async () => {
+    await assertSpendLease();
     const input = inputObject(params);
     if (!Number.isSafeInteger(input.allocationKey) || input.allocationKey < 1) throw new BridgeError('Invalid vault allocation key.');
     const startHeight = await syncedHeight();
     const key = String(input.allocationKey);
     if (Object.hasOwn(ledger.allocations, key)) return ledger.allocations[key];
+    await assertSpendLease();
     const created = parsed(await native.create_new_unified_address('o'));
     if (created.account !== 0 || created.has_orchard !== true || created.has_sapling !== false || created.has_transparent !== false || !Number.isSafeInteger(created.address_index)) throw new BridgeError('Unsupported native address derivation.');
     const address = await orchardRecipient(created.encoded_address);
-    await native.save_wallet_file();
+    if (actionsState) await saveActionsCheckpoint();
+    else await native.save_wallet_file();
     fs.chmodSync(publicWallet.walletPath, 0o600);
     const allocation = { address, accountId: '0', allocationKey: input.allocationKey, addressIndex: created.address_index, startHeight };
-    persistLedger({ ...ledger, allocations: { ...ledger.allocations, [key]: allocation } });
+    await persistLedger({ ...ledger, allocations: { ...ledger.allocations, [key]: allocation } });
     return allocation;
   }),
   vault_verify_deposit: async params => {
@@ -197,33 +246,37 @@ const vaultMethods = {
     try { prepared = await prepare(input); }
     catch (error) { throw new PrebroadcastError(error instanceof BridgeError ? error.message : 'The wallet preflight failed before any payout proposal or broadcast was dispatched.'); }
     const reservation = { address: prepared.address, shieldedAddress: prepared.shieldedAddress, amountZatoshis: input.amountZatoshis, memo: input.memo, state: 'reserved', createdAt: new Date().toISOString() };
-    try { persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: reservation } }); }
+    try { await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: reservation } }); }
     catch { return cancelBeforeBroadcast(key, 'The payout could not be reserved before wallet dispatch.', false, false); }
     let proposalDispatched = false;
     let confirmDispatched = false;
     try {
       // native.send creates a stored proposal only. native.confirm is the only
       // signing/broadcast dispatch here; cancellation before it proves no send.
+      await assertSpendLease();
       proposalDispatched = true;
       const proposal = parsed(await native.send(JSON.stringify([{ address: prepared.shieldedAddress, amount: input.amountZatoshis, memo: input.memo }])));
       if (proposal?.error || !Number.isSafeInteger(proposal?.fee) || proposal.fee < 0 || prepared.spendableZatoshis < input.amountZatoshis + proposal.fee) {
         return await cancelBeforeBroadcast(key, 'The wallet rejected the payout proposal before broadcast; no payout was sent.', proposalDispatched, confirmDispatched);
       }
-      try { persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, state: 'broadcasting', feeZatoshis: proposal.fee } } }); }
+      try { await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, state: 'broadcasting', feeZatoshis: proposal.fee } } }); }
       catch { return await cancelBeforeBroadcast(key, 'The payout reservation could not be made durable before broadcast; no payout was sent.', proposalDispatched, confirmDispatched); }
+      await assertSpendLease();
       confirmDispatched = true;
       const sent = parsed(await native.confirm());
-      await native.save_wallet_file();
+      if (actionsState) await saveActionsCheckpoint();
+      else await native.save_wallet_file();
       if (sent?.error || !Array.isArray(sent?.txids) || sent.txids.length !== 1 || !/^[0-9a-f]{64}$/.test(sent.txids[0])) throw new BridgeError('Payout broadcast is uncertain. The bridge will not resend; reconcile the native wallet.');
-      persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...ledger.sends[key], state: 'broadcast', txid: sent.txids[0] } } });
+      await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...ledger.sends[key], state: 'broadcast', txid: sent.txids[0] } } });
       return { txid: sent.txids[0], broadcast: true };
     } catch (error) {
       if (error instanceof PrebroadcastError) throw error;
-      persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...ledger.sends[key], state: 'unknown' } } });
+      await persistLedger({ ...ledger, sends: { ...ledger.sends, [key]: { ...reservation, ...ledger.sends[key], state: 'unknown' } } });
       throw error instanceof BridgeError ? error : new BridgeError('Payout broadcast is uncertain. The bridge will not resend; reconcile the native wallet.');
     }
   }),
   vault_release_prebroadcast: params => serializeWrite(async () => {
+    await assertSpendLease();
     const input = inputObject(params);
     const key = sendKey(input.memo);
     // A dispatched send always has a durable memo reservation first. Absence
@@ -283,6 +336,10 @@ httpServer.requestTimeout = 10000;
 httpServer.headersTimeout = 5000;
 httpServer.keepAliveTimeout = 5000;
 (async () => {
+  if (actionsState) {
+    const stored = await actionsState.load(actionsOwner, actionsGeneration);
+    persistLocalLedger(loadedLedger(stored.ledger));
+  }
   native.set_wallet_base_dir(base + '/zingo-wallet');
   native.init_from_b64(server, 'test', 'Low', 1, walletName);
   await native.run_sync();
@@ -293,9 +350,21 @@ httpServer.keepAliveTimeout = 5000;
   await cycle();
 })().catch(error => { lastError = String(error.message || error); saveStatus(); process.exit(1); });
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   httpServer.close();
-  try { await native.stop_sync(); await native.save_wallet_file(); } catch {}
-  running = false; saveStatus(); process.exit(0);
+  let exitCode = 0;
+  try {
+    await serializeWrite(async () => {
+      await native.stop_sync();
+      if (actionsState) await saveActionsCheckpoint();
+      else await native.save_wallet_file();
+    });
+  } catch {
+    if (actionsState) { exitCode = 1; lastError = 'The hosted wallet shutdown checkpoint could not be saved durably.'; }
+  }
+  if (actionsState) await actionsState.close().catch(() => {});
+  running = false; saveStatus(); process.exit(exitCode);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
