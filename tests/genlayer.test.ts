@@ -33,7 +33,7 @@ def run_nondet_unsafe(leader, validator):
     return result
 
 gl = types.SimpleNamespace(
-    Contract=object, public=Public(), message=types.SimpleNamespace(sender_account="deployer"),
+    Contract=object, public=Public(), message=types.SimpleNamespace(sender_address="deployer"),
     nondet=types.SimpleNamespace(exec_prompt=exec_prompt),
     vm=types.SimpleNamespace(UserError=UserError, Return=Return, run_nondet_unsafe=run_nondet_unsafe),
 )
@@ -46,13 +46,13 @@ contract_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contract_module)
 contract = contract_module.ZCashedEscrow("Public summary", "State the issue in a concise summary.")
 assert contract.owner == "deployer"
-gl.message.sender_account = "stranger"
+gl.message.sender_address = "stranger"
 try:
     contract.accept_job("worker:" + "a" * 64)
     raise AssertionError("Non-deployer changed contract state")
 except UserError:
     pass
-gl.message.sender_account = "deployer"
+gl.message.sender_address = "deployer"
 contract.accept_job("worker:" + "a" * 64)
 scenario = sys.argv[1] if len(sys.argv) > 1 else "approved"
 content = "The issue is a missing keyboard shortcut in the editor."
@@ -66,7 +66,7 @@ elif scenario in ("missing", "missing_upper"):
 elif scenario == "wrong_worker":
     worker = "worker:" + "b" * 64
 elif scenario == "unauthorized":
-    gl.message.sender_account = "stranger"
+    gl.message.sender_address = "stranger"
 elif scenario in ("needs_revision", "inconclusive", "limit"):
     status = "failed" if scenario in ("needs_revision", "limit") else "inconclusive"
     answers = [{"criteria": [{"id": "C1", "status": status, "feedback": "Add the public issue text."}]}]
