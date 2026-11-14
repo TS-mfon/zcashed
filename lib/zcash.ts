@@ -71,11 +71,12 @@ function unifiedPools(bytes: Uint8Array, prefix: string): ShieldedPool[] {
     }
     if (type.value === 0 || type.value === 1) {
       if (length.value !== 20 || previous === 0) throw new Error('Invalid transparent receiver in Unified Address.')
-    } else {
-      if (type.value !== 2 && type.value !== 3) throw new Error('This demo supports Sapling and Orchard shielded receivers only.')
+    } else if (type.value === 2 || type.value === 3) {
       if (length.value !== 43) throw new Error('Invalid shielded receiver length.')
       pools = [...pools, type.value === 3 ? 'orchard' : 'sapling']
     }
+    // ZIP 316 permits opaque future receivers alongside known shielded ones.
+    // Payments select a known Orchard receiver at the native wallet boundary.
     previous = type.value
     offset = length.next + length.value
   }
