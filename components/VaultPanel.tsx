@@ -5,11 +5,13 @@ import Image from 'next/image'
 import { Copy, LockKeyhole, ShieldCheck } from 'lucide-react'
 import type { Job } from '@/lib/types'
 import { buildPaymentRequest, formatZatoshis, parseShieldedAddress } from '@/lib/zcash'
+import { useWallet } from './WalletContext'
 
 type Operation = { purpose: 'worker_payout' | 'client_refund'; state: string; txid?: string; confirmations: number; message: string }
 type Props = { job: Job; actorAddress: string | null; onChange: () => void | Promise<void> }
 
 export default function VaultPanel({ job, actorAddress, onChange }: Props) {
+  const { requestWalletPayment } = useWallet()
   const client = actorAddress === job.clientAddress
   const worker = !!job.workerAddress && actorAddress === job.workerAddress
   const funded = !!job.fundedAt && job.fundedZatoshis >= job.budgetZatoshis
@@ -21,6 +23,7 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [walletRequest, setWalletRequest] = useState<{ uri: string; state: 'pending' | 'submitted' | 'uncertain' } | null>(null)
   const operation = receipt?.jobId === job.id ? receipt.operation : null
   const operationLoaded = receipt?.jobId === job.id
   const payment = useMemo(() => {
@@ -67,6 +70,12 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
       }
       if (path === 'funding') setNotice(data.received ? 'The wallet confirmed your exact deposit. ' + (data.job?.status === 'open' ? 'The job is now open.' : 'The deposit remains available for a client refund.') : 'No confirmed matching deposit yet. Wait for a block and check again.')
       else if (data.operation) setReceipt({ jobId: job.id, operation: data.operation })
+      else if (data.operation === null) {
+        setReceipt({ jobId: job.id, operation: null })
+        setSubmitted(false)
+        setAuthorized(false)
+        setNotice('The server confirmed that no payout was sent. Review the address and authorize a new request when ready.')
+      }
       await onChange()
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'The vault action could not be completed.') }
     finally { setBusy(false) }
@@ -88,6 +97,20 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
     if (!payment) return
     try { await navigator.clipboard.writeText(payment.uri); setNotice('Deposit request copied.') }
     catch { setError('Clipboard unavailable. Select and copy the request below.') }
+  }
+
+  async function payWithZucchini() {
+    if (!payment || walletRequest?.uri === payment.uri || busy) return
+    setWalletRequest({ uri: payment.uri, state: 'pending' })
+    setError(''); setNotice('')
+    try {
+      const result = await requestWalletPayment(payment.uri)
+      setWalletRequest({ uri: payment.uri, state: 'submitted' })
+      setNotice(`Zucchini submitted the deposit (${result.txid}). This is not a confirmed receipt. Wait for a block, then check the confirmed deposit.`)
+    } catch (cause) {
+      setWalletRequest({ uri: payment.uri, state: 'uncertain' })
+      setError((cause instanceof Error ? cause.message : 'The wallet request could not be resolved.') + ' Check Zucchini Activity and the confirmed deposit before making another payment. This page will not resend automatically.')
+    }
   }
 
   if (!job.vaultAddress || job.vaultNetwork !== 'testnet') return null
@@ -115,7 +138,8 @@ export default function VaultPanel({ job, actorAddress, onChange }: Props) {
           </p>
           {qr?.uri === payment.uri && <Image src={qr.image} width={256} height={256} unoptimized alt="Testnet Zcash job deposit request QR" style={{ maxWidth: '100%', height: 'auto', margin: '0 auto 16px' }} />}
           <div className="flex flex-wrap gap-3" style={{ marginBottom: 16 }}>
-            <a href={payment.uri} className="btn btn-primary" style={{ minHeight: 44 }}>Open deposit in wallet</a>
+            <button type="button" onClick={() => { void payWithZucchini() }} disabled={busy || walletRequest?.uri === payment.uri} className="btn btn-primary" style={{ minHeight: 44 }}>{walletRequest?.uri === payment.uri ? walletRequest.state === 'pending' ? 'Approve in Zucchini…' : 'Wallet request sent · check Activity' : 'Pay deposit with Zucchini'}</button>
+            <a href={payment.uri} className="btn btn-outline" style={{ minHeight: 44 }}>Open deposit URI</a>
             <button type="button" className="btn btn-outline" onClick={copyRequest} style={{ minHeight: 44 }}><Copy size={15} /> Copy request</button>
           </div>
           <label htmlFor="vault-request" style={{ display: 'block', fontSize: 12, marginBottom: 6 }}>Testnet deposit request</label>

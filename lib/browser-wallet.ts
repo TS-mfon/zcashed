@@ -22,7 +22,8 @@ function provider(): ZucchiniProvider | null {
 async function permissions(wallet: ZucchiniProvider, requested: string[]): Promise<void> {
   if (typeof wallet.connect !== 'function') throw new Error('Zucchini was detected, but this version does not expose its website connection interface. Enable website connections or update the wallet.')
   const grant = object(await wallet.connect(requested))
-  if (grant?.connected !== true || !Array.isArray(grant.approvedPermissions) || requested.some((permission) => !grant.approvedPermissions!.includes(permission))) {
+  const approved = grant?.approvedPermissions
+  if (grant?.connected !== true || !Array.isArray(approved) || requested.some((permission) => !approved.includes(permission))) {
     throw new Error('Approve the requested permissions in Zucchini to continue.')
   }
 }
